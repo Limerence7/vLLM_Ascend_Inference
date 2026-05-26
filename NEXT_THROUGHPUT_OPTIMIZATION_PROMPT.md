@@ -4,9 +4,9 @@
 
 目标模型：`/workspace/models/Qwen3-235B-A22B`
 
-当前结论：对 Qwen3-235B-A22B 的吞吐优化，后续重点转向 `expert_wise`。`layer_wise` 可以释放更多 KV cache，但在当前实现下每个 offload 层搬整层 expert，decode 阶段表现为 worker 满 CPU、NPU AICore 接近 0，不适合这轮“尽快提升整体吞吐”的目标。
+当前目标：提高 **expert-wise offload 后的吞吐量**，尽量接近原始 vLLM-Ascend/native 路径。当前不把 FlashInfer 作为讨论重点，因为用户关心的是卸载后的吞吐表现，而不是 FlashInfer/native 开关本身。
 
-## 已测基线
+## 已知基线
 
 naive 运行命令：
 
@@ -27,162 +27,335 @@ naive 结果：
 
 layer-wise 观察：
 
-- 修复后可完成启动和 profile。
-- KV cache 可提升到约 `87k-93k` tokens。
-- decode 阶段长期无 token 产出，worker 接近 100% CPU，NPU AICore 接近 0。
-- 初步判断瓶颈是整层 expert CPU->NPU 搬运和 Python 调度开销，当前不作为 235B 吞吐主线。
+- 可释放更多 KV cache，约 `87k-93k` tokens。
+- decode 阶段长期无 token 产出，worker 接近满 CPU，NPU AICore 接近 0。
+- 判断瓶颈是整层 expert CPU->NPU 搬运和 Python 调度，当前不作为 235B 吞吐主线。
 
-## 之前已经做过的改进
+## 本轮已经完成
 
-1. 运行脚本参数化
-   - `naive_run.py`、`offloading_run.py` 支持通过环境变量切换 `MODEL_PATH`、batch、长度、world size、utilization 等参数。
-   - 可直接跑 235B，不再手改脚本。
+### 代码改动
 
-2. expert-wise 快路径
-   - 增加大 batch fast path，避免插件额外做一次 routing select。
-   - 增加 small batch single-select 方向的基础逻辑，减少重复路由开销。
+1. compact sizing 和 summary 诊断
+   - 在 `src/fused_moe/fused_moe.py` 增加 `expert_wise_compact_sizing`。
+   - summary 增加：
+     - `compact_sizing_examples`
+     - `total_chunked_compact_forward_count`
+     - `total_chunked_compact_piece_count`
+     - `total_chunked_compact_token_count`
+     - `total_chunked_compact_full_token_count`
+   - 目的：区分真实 compact offload、no-shrink skip、capacity unsafe skip。
 
-3. expert-wise compact/offload 稳定性
-   - 增加 `partition_scope=local_rank`，避免 global suffix 只让部分 rank 发生 offload。
-   - 增加 no-shrink / capacity-unsafe skip，避免 compact 后没有 HBM 收益却引入调度和 copy 开销。
-   - `wait_for_prefetch()` 对同一 event 去重等待。
-   - offload summary 增加 skip、copy、prefetch、routing 等聚合计数。
+2. chunked compact forward
+   - 支持 compact cache 下 `offloaded_local > NPU_CACHE_CAPACITY`。
+   - 之前这种配置会因为 capacity unsafe 跳过真实卸载；现在可以将 offloaded experts 分 chunk 加载和计算。
+   - 相关开关：
+     - `ENABLE_CHUNKED_COMPACT_FORWARD=1`
+     - `ExpertWiseConfig.enable_chunked_compact_forward=True`
 
-4. compact dispatcher 优化
-   - AllGather compact dispatch patch 改为 activate/deactivate 方式，避免每个 forward 反复 monkey patch。
-   - 保留原始 dispatch，便于 fallback。
+3. profile/warmup compact dispatch 修复
+   - 修复 profile run 中 compact AllGather dispatch 未激活导致的维度错误。
+   - 之前真实 compact 配置会遇到类似：
+     - `groupList size 16 should equal weight dim0 14`
+   - 现在 profile/warmup 会在 compact 权重 slot 数下激活 compact dispatch。
 
-5. layer-wise 兼容修复
-   - 修复 Qwen3-235B-A22B expert 权重布局不一致导致的 `w13_weight` shape mismatch。
-   - owner buffer 标记为已加载，避免 layer 0 首次 forward 不必要拷贝。
-   - 修复 layer-wise prefetch distance 语义，使 `prefetch_distance=16` 表示提前 16 个模型层。
-   - `offloading_run.py` 中 layer-wise 默认开启 async prefetch。
+4. chunked dispatch 次数优化
+   - 将 resident experts 合并到第一个 offloaded chunk。
+   - 例如 `resident + [offloaded chunk 1]` 作为第一段，后续只跑剩余 offloaded chunk。
+   - 这样 `NPU_CACHE_CAPACITY=3`、本地 offloaded=4 时，常见 piece 数从 3 降到 2。
 
-6. 验证状态
-   - `tests/test_expert_wise_scheduler.py` 和 `tests/test_layer_wise_scheduler.py` 当前通过。
-   - 关键 Python 文件已做过 `py_compile` 验证。
+5. token 子集筛选实验
+   - 实现了只对当前 chunk 命中 token 做 fused_experts，再 scatter 回全量输出。
+   - 实测变慢，因此默认关闭：
+     - `ENABLE_COMPACT_CHUNK_TOKEN_FILTER=0`
+     - `ExpertWiseConfig.enable_compact_chunk_token_filter=False`
+   - 保留为实验开关，不建议作为默认吞吐路径。
 
-## 接下来边推理边优化的主计划
+### 验证
 
-### P0：先建立 expert-wise 235B 可运行基线
-
-先确认环境干净：
+已通过：
 
 ```bash
-ps -ef | rg 'offloading_run.py|naive_run.py|EngineCore|VLLM::Worker' | rg -v rg
-npu-smi info
+pytest -q tests/test_expert_wise_scheduler.py
+python -m py_compile src/config/expertwise_config.py src/fused_moe/fused_moe.py src/expert_wise/manager.py src/utils/summary.py offloading_run.py
 ```
 
-先用小输出快速验证启动和 summary：
+当前结果：
+
+- `16 passed`
+- `py_compile` 通过
+
+## 已测配置和结果
+
+### 1. no-shrink 配置：`RESIDENT_EXPERTS=96 / NPU_CACHE_CAPACITY=4`
+
+命令要点：
+
+```bash
+RESIDENT_EXPERTS=96
+NPU_CACHE_CAPACITY=4
+PARTITION_SCOPE=local_rank
+COMPACT_NPU_CACHE=1
+SKIP_NO_SHRINK_COMPACT=1
+```
+
+结果：
+
+- 短输出：约 `385.598 tok/s`
+- 64 tokens：约 `460.527 tok/s`
+- 但这不是有效卸载结果：
+  - `total_no_shrink_skipped_layers=94`
+  - `compact_enabled_layers=0`
+  - `offloaded_layers=0`
+- 原因：
+  - 每 rank resident local=12、offloaded local=4、cache=4。
+  - compact slots = 16，等于原始 local slots，没有 HBM shrink。
+
+结论：这个配置看起来快，但没有真实 expert offload，不用于后续卸载吞吐对比。
+
+### 2. 真实 compact：`RESIDENT_EXPERTS=96 / NPU_CACHE_CAPACITY=2`
+
+命令要点：
+
+```bash
+RESIDENT_EXPERTS=96
+NPU_CACHE_CAPACITY=2
+PREFETCH_DISTANCE=1
+ENABLE_LARGE_BATCH_FAST_PATH=0
+ENABLE_SINGLE_SELECT_FORWARD=1
+ENABLE_CHUNKED_COMPACT_FORWARD=1
+```
+
+结果：
+
+- KV cache：约 `39,424` tokens
+- `output_tokens_per_second=41.438`
+- 真实卸载：
+  - `compact_enabled_layers=94`
+  - `offloaded_layers=94`
+  - `total_cpu_store_bytes=14193524736` per worker
+- copy/chunked 代价很高：
+  - copy count 约 `2491-2911` per worker
+  - chunked piece count 约 `1248-1776` per worker
+
+结论：真实卸载成立，但吞吐太低。
+
+### 3. 真实 compact：`RESIDENT_EXPERTS=96 / NPU_CACHE_CAPACITY=3`
+
+推荐对比命令：
 
 ```bash
 MODEL_PATH=/workspace/models/Qwen3-235B-A22B \
 OFFLOAD_MODE=expert_wise \
 BATCH_SIZE=128 MAX_LENGTH=64 MAX_NEW_TOKENS=8 \
 WORLD_SIZE=8 UTILIZATION=0.98 \
-PREFETCH_DISTANCE=1 OFFLOAD_INTERVAL=1 \
+PREFETCH_DISTANCE=0 OFFLOAD_INTERVAL=1 \
 PARTITION_SCOPE=local_rank \
-RESIDENT_EXPERTS=96 NPU_CACHE_CAPACITY=4 \
+RESIDENT_EXPERTS=96 NPU_CACHE_CAPACITY=3 \
 COMPACT_NPU_CACHE=1 SKIP_NO_SHRINK_COMPACT=1 \
-ENABLE_LARGE_BATCH_FAST_PATH=1 ENABLE_SINGLE_SELECT_FORWARD=1 \
+ENABLE_LARGE_BATCH_FAST_PATH=0 ENABLE_SINGLE_SELECT_FORWARD=1 \
+ENABLE_CHUNKED_COMPACT_FORWARD=1 ENABLE_COMPACT_CHUNK_TOKEN_FILTER=0 \
 LOG_TRANSFERS=0 \
 python offloading_run.py
 ```
 
-观察重点：
+结果：
 
-- 是否能完成 generate。
-- `output_tokens_per_second` 是否接近或超过 naive 的 `338.213 tok/s`。
-- summary 中是否有实际 `offloaded_experts`，且不是 no-shrink skip。
-- `copy_count`、`prefetch_count`、`prefetch_wait_count` 是否过高。
-- NPU AICore 是否有计算利用率，避免重现 layer-wise 的 CPU 忙等。
+- 当前真实 compact 最佳：约 `53 tok/s`
+- 具体已测：
+  - `PREFETCH_DISTANCE=1`，合并 resident+first chunk 后：`53.513 tok/s`
+  - `PREFETCH_DISTANCE=0`：`53.222 tok/s`
+- KV cache：约 `39,168` tokens
+- 真实卸载：
+  - `compact_enabled_layers=94`
+  - `offloaded_layers=94`
+  - `total_cpu_store_bytes=14193524736` per worker
+- `PREFETCH_DISTANCE=0` 后：
+  - `prefetch_count=0`
+  - `prefetch_wait_count=0`
+  - copy count 仍约 `737-930` per worker
 
-如果短输出可用，再跑与 naive 相同参数：
+结论：prefetch/wait 不是主瓶颈。核心瓶颈是 on-demand CPU->NPU copy 和每层多次 chunked fused dispatch。
+
+### 4. 真实 compact：`RESIDENT_EXPERTS=112 / NPU_CACHE_CAPACITY=1`
+
+命令要点：
+
+```bash
+RESIDENT_EXPERTS=112
+NPU_CACHE_CAPACITY=1
+PREFETCH_DISTANCE=0
+ENABLE_LARGE_BATCH_FAST_PATH=0
+ENABLE_CHUNKED_COMPACT_FORWARD=1
+```
+
+结果：
+
+- `output_tokens_per_second=50.182`
+- KV cache：约 `36,096` tokens
+- CPU store 下降到约 `7096762368` bytes per worker
+- 但 chunked forward 次数更高：
+  - chunked forward count 约 `366-485` per worker
+  - chunked piece count 约 `732-970` per worker
+
+结论：提高 resident、减少 offloaded experts 并没有提高吞吐。`cache=1` 导致 chunked dispatch 更频繁，整体更慢。
+
+### 5. token 子集筛选实验
+
+命令要点：
+
+```bash
+RESIDENT_EXPERTS=96
+NPU_CACHE_CAPACITY=3
+PREFETCH_DISTANCE=0
+ENABLE_COMPACT_CHUNK_TOKEN_FILTER=1
+```
+
+结果：
+
+- `output_tokens_per_second=45.667`
+- token 筛选确实生效：
+  - 每 worker `chunked_compact_token_count / full_token_count` 约 `52%-54%`
+- 但吞吐下降。
+
+结论：小 batch/子 batch fused MoE 调用、切片和 scatter 的额外开销大于省下的计算。该开关保留但默认关闭。
+
+### 6. `RESIDENT_EXPERTS=104 / NPU_CACHE_CAPACITY=2`
+
+状态：
+
+- 启动后卡在 EngineCore/HCCL 初始化附近，没有进入 Worker_TP 加载阶段。
+- 已终止，无遗留进程。
+
+结论：本轮没有得到有效吞吐数据。若后续重测，先确认 NPU/HCCL 状态干净。
+
+## 当前判断
+
+当前真实卸载吞吐和 naive 的差距很大：
+
+- naive：`338.213 tok/s`
+- 当前最佳真实 compact offload：约 `53 tok/s`
+
+主要瓶颈不是 FlashInfer，也不是 prefetch wait，而是：
+
+1. compact cache 比本地 offloaded expert 少 1 个 slot 时，路由常命中全部 offloaded experts。
+2. 每层 decode 经常需要至少一次 CPU->NPU 换入。
+3. chunked compact 会对同一层 MoE 做多次 fused dispatch。
+4. token 子集化会降低计算量，但小 batch dispatch/切片/scatter 成本更高。
+
+所以后续要接近原生，重点不应是继续微调 prefetch，也不应只靠提高 resident；应优先减少：
+
+- CPU->NPU copy 次数
+- chunked fused dispatch 次数
+- 每次 dispatch 的 Python/通信开销
+
+## 下一步计划
+
+### P0：保持可复现实验基线
+
+先确认没有后台进程：
+
+```bash
+ps -ef | rg 'offloading_run.py|naive_run.py|EngineCore|Worker_TP|VLLM::Worker' | rg -v rg
+npu-smi info
+```
+
+当前建议基线命令：
 
 ```bash
 MODEL_PATH=/workspace/models/Qwen3-235B-A22B \
 OFFLOAD_MODE=expert_wise \
-BATCH_SIZE=128 MAX_LENGTH=64 MAX_NEW_TOKENS=64 \
+BATCH_SIZE=128 MAX_LENGTH=64 MAX_NEW_TOKENS=8 \
 WORLD_SIZE=8 UTILIZATION=0.98 \
-PREFETCH_DISTANCE=1 OFFLOAD_INTERVAL=1 \
+PREFETCH_DISTANCE=0 OFFLOAD_INTERVAL=1 \
 PARTITION_SCOPE=local_rank \
-RESIDENT_EXPERTS=96 NPU_CACHE_CAPACITY=4 \
+RESIDENT_EXPERTS=96 NPU_CACHE_CAPACITY=3 \
 COMPACT_NPU_CACHE=1 SKIP_NO_SHRINK_COMPACT=1 \
-ENABLE_LARGE_BATCH_FAST_PATH=1 ENABLE_SINGLE_SELECT_FORWARD=1 \
+ENABLE_LARGE_BATCH_FAST_PATH=0 ENABLE_SINGLE_SELECT_FORWARD=1 \
+ENABLE_CHUNKED_COMPACT_FORWARD=1 ENABLE_COMPACT_CHUNK_TOKEN_FILTER=0 \
 LOG_TRANSFERS=0 \
 python offloading_run.py
 ```
 
-### P1：根据日志调 expert-wise 配置
+判断标准：
 
-按吞吐和 summary 做网格小测，每次只改一个关键变量：
+- 应该真实 offload：
+  - `compact_enabled_layers=94`
+  - `offloaded_layers=94`
+- 吞吐应在 `53 tok/s` 左右。
+- 如果显著低于该值，先排查环境、NPU 状态、是否误开 `ENABLE_COMPACT_CHUNK_TOKEN_FILTER=1`。
 
-1. `RESIDENT_EXPERTS`
-   - 候选：`112`、`104`、`96`、`88`
-   - 目标：找到 HBM 释放和 CPU->NPU copy 开销的平衡点。
+### P1：减少 chunked dispatch 次数
 
-2. `NPU_CACHE_CAPACITY`
-   - 候选：`2`、`4`、`8`
-   - 如果 routed offloaded experts 经常超过 capacity，增大 cache。
-   - 如果 copy 开销高且 HBM 紧张，优先降低 offloaded 数量，而不是盲目增大 cache。
+优先考虑结构：
 
-3. `OFFLOAD_INTERVAL`
-   - 候选：`1`、`2`、`4`
-   - 如果每层都 offload 导致 copy 过多，拉大 interval。
-   - 对 235B 首先以吞吐为目标，不追求最大 KV cache。
+1. 对 `offloaded_count = cache_capacity + 1` 的情况做专门路径
+   - 当前 `96/3` 正是每 rank 4 个 offloaded、本地 cache 3 个。
+   - 常见场景只差 1 个 slot。
+   - 可以尝试在一个 forward 内复用 resident+cache 结果，只对缺失的 1 个 expert 做补算。
 
-4. `PREFETCH_DISTANCE`
-   - 候选：`1`、`2`
-   - 观察 `prefetch_wait_count` 和吞吐。等待多说明预取太近或 copy 太慢。
+2. 避免第二个 chunk 再跑完整 fused MoE
+   - token 子集筛选已验证直接切 token 会变慢。
+   - 但仍可探索 expert-level 补算，避免全 top-k dispatch。
+   - 方向：只对缺失 expert 的 token 做更轻量的 matmul/MLP，而不是再次调用完整 fused experts。
 
-### P2：低风险代码优化
+3. 将 chunked 路径做成“resident/cache 主路径 + missing expert 补偿”
+   - 主路径尽量接近原始 fused MoE。
+   - 缺失 expert 的输出单独计算后加回。
+   - 这比当前多次 masked fused MoE 更接近原生吞吐。
 
-优先改动范围小、可用真实短测快速验证的点：
+### P2：减少 CPU->NPU copy 次数
 
-1. 减少热路径 Python 分配
-   - 缓存每层常用 set/list。
-   - 避免每次 forward 构造重复 closure/context。
+1. cache 策略从 LRU 改为 decode-step 友好
+   - 当前 cache_slots 是 LRU。
+   - 对 MoE decode 来说，最近一步的 LRU 未必是下一步最优。
+   - 可利用上一层/上一 token 的 routed experts 做预测，减少抖动。
 
-2. 继续收敛 single-select
-   - 小 batch 下插件和 vLLM 原始 MoE 可能重复 select。
-   - 目标是在 `ExpertWiseAscendFusedMoE.forward_impl` 中只 select 一次，同时复用 `topk_ids/topk_weights` 做调度和 fused experts。
+2. 优先保留高频 offloaded experts
+   - 统计每层 offloaded expert 命中频率。
+   - 对高频 expert 做 sticky cache，低频 expert 才被 evict。
+   - summary 需要增加 per expert hit/miss，先只在 debug 开关下记录，避免热路径开销。
 
-3. 优化 CPU->NPU copy
-   - 当前 expert-wise 仍可能逐 expert、逐 tensor copy。
-   - 下一步做 packed CPU store 或连续 slot 批量 copy。
-   - 先只支持 unquantized BF16，保证 235B 路径正确。
+3. 批量 copy 或 packed CPU store
+   - 当前按 expert、按 tensor copy。
+   - 可以尝试 packed CPU tensor，连续 expert 一次 copy。
+   - 先只支持 unquantized BF16 路径，覆盖 235B 当前实验。
 
-4. summary 更精细
-   - 增加每层 copy/prefetch/select 计数。
-   - 让下一次调参能快速定位是哪些层拖慢。
+### P3：重新评估配置网格，但只测有意义点
 
-### P3：中高风险优化
+不要再测 `NPU_CACHE_CAPACITY=4` 当作真实卸载配置，因为它 no-shrink。
 
-这些先不作为第一轮实现，除非 P1/P2 后仍无法接近 naive：
+建议候选：
 
-1. resident/offloaded compute split
-   - resident experts 先算，offloaded experts 异步加载后再算，最后合并。
-   - 这是理论收益最大的重构，但涉及通信、dispatch、grouped matmul 和输出合并，风险较高。
+1. `RESIDENT_EXPERTS=96 / NPU_CACHE_CAPACITY=3`
+   - 当前真实 offload 最佳基线。
 
-2. MC2/FusedMC2 compact dispatch
-   - 当前 compact dispatch 主要覆盖 AllGather。
-   - 如果 vLLM-Ascend 的 MC2/FusedMC2 在 235B batch=128 更快，需要补对应 patch。
+2. `RESIDENT_EXPERTS=88 / NPU_CACHE_CAPACITY=4 或 5`
+   - 需要先算是否真实 shrink。
+   - 目标是判断更多 offloaded experts + 较大 cache 是否能减少 chunked piece。
 
-3. 非 eager / 编译路径
-   - 可测试 `ENFORCE_EAGER=0`。
-   - 之前 30B 上非 eager 有过长时间卡住，需独立验证，不和主要优化混在一起。
+3. `OFFLOAD_INTERVAL=2`
+   - 如果全层 offload copy 过多，可只 offload 一半层。
+   - 目标是提升吞吐，同时保留一部分 KV cache 收益。
 
-## 推荐下一步执行顺序
+4. `MAX_NEW_TOKENS=64`
+   - 只有短输出稳定后再跑。
+   - 用于和 naive `338.213 tok/s` 做正式对比。
 
-1. 跑 `expert_wise` 235B 短输出基线，确认能生成。
-2. 跑同参数 `MAX_NEW_TOKENS=64`，和 naive `338.213 tok/s` 对比。
-3. 如果吞吐低，先调 `RESIDENT_EXPERTS`、`NPU_CACHE_CAPACITY`、`OFFLOAD_INTERVAL`。
-4. 如果 copy/prefetch 计数明显过高，做 packed copy 或减少 offload 层。
-5. 如果 routing/select 计数高，优先完成 single-select forward。
-6. 每次改动都先跑短输出，再跑完整 64 tokens。
+### P4：保留但不要默认启用的实验
 
-## 交接提示词
+1. `ENABLE_COMPACT_CHUNK_TOKEN_FILTER=1`
+   - 已证明在 `96/3` 下变慢。
+   - 除非底层 fused MoE 对小 batch 有优化，否则不建议继续主推。
+
+2. `PREFETCH_DISTANCE=1/2`
+   - `PREFETCH_DISTANCE=0` 和 `1` 吞吐基本持平。
+   - 因为主瓶颈是 copy 和 dispatch，不是等待 event。
+
+3. layer-wise
+   - 当前不是 235B 吞吐主线。
+
+## 推荐交接提示词
 
 从这里继续：
 
-> 继续在 `/workspace/Huawei/vLLM_Ascend_Inference` 优化 Qwen3-235B-A22B 的 expert-wise offload 吞吐。先确认没有后台 vLLM 进程，然后用 `MODEL_PATH=/workspace/models/Qwen3-235B-A22B OFFLOAD_MODE=expert_wise BATCH_SIZE=128 MAX_LENGTH=64 MAX_NEW_TOKENS=8 WORLD_SIZE=8 UTILIZATION=0.98 PARTITION_SCOPE=local_rank RESIDENT_EXPERTS=96 NPU_CACHE_CAPACITY=4` 跑短输出基线。根据吞吐、summary 和 NPU 利用率调参，再跑 `MAX_NEW_TOKENS=64` 对比 naive 的 `338.213 tok/s`。优先做 expert-wise 的低风险吞吐优化，不再把 layer-wise 作为 235B 吞吐主线。
+> 继续在 `/workspace/Huawei/vLLM_Ascend_Inference` 优化 Qwen3-235B-A22B 的 expert-wise offload 吞吐。用户当前关心的是卸载后的吞吐接近原生，不要把 FlashInfer 作为主线。当前真实 compact offload 最佳基线是 `RESIDENT_EXPERTS=96 NPU_CACHE_CAPACITY=3 PREFETCH_DISTANCE=0 ENABLE_LARGE_BATCH_FAST_PATH=0 ENABLE_SINGLE_SELECT_FORWARD=1 ENABLE_CHUNKED_COMPACT_FORWARD=1 ENABLE_COMPACT_CHUNK_TOKEN_FILTER=0`，短输出约 `53 tok/s`，真实卸载 94 层，CPU store 约 `14.19GB/worker`，KV cache 约 `39,168 tokens`。`96/4` 是 no-shrink，不算真实卸载；`112/1` 约 `50 tok/s`；token filter 约 `45.7 tok/s`，默认关闭。下一步优先减少 chunked fused dispatch 和 CPU->NPU copy 次数，探索 resident/cache 主路径 + missing expert 补偿，而不是继续微调 prefetch 或单纯增加 resident。

@@ -87,6 +87,11 @@ OFFLOAD_CONFIG = OffloadConfig(
         skip_no_shrink_compact=env_bool("SKIP_NO_SHRINK_COMPACT", True),
         enable_large_batch_fast_path=env_bool("ENABLE_LARGE_BATCH_FAST_PATH", True),
         enable_single_select_forward=env_bool("ENABLE_SINGLE_SELECT_FORWARD", True),
+        enable_chunked_compact_forward=env_bool("ENABLE_CHUNKED_COMPACT_FORWARD", True),
+        enable_compact_chunk_token_filter=env_bool(
+            "ENABLE_COMPACT_CHUNK_TOKEN_FILTER",
+            False,
+        ),
         large_batch_active_ratio=float(os.getenv("LARGE_BATCH_ACTIVE_RATIO", "0.8")),
         log_transfers=env_bool("LOG_TRANSFERS", False),
         max_transfer_logs=int(os.getenv("MAX_TRANSFER_LOGS", "96")),

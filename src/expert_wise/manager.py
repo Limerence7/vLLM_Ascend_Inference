@@ -137,6 +137,26 @@ class ExpertWiseManager:
                 for item in summaries.values()
                 if isinstance(item, dict)
             ),
+            "total_chunked_compact_forward_count": sum(
+                item.get("chunked_compact_forward_count", 0)
+                for item in summaries.values()
+                if isinstance(item, dict)
+            ),
+            "total_chunked_compact_piece_count": sum(
+                item.get("chunked_compact_piece_count", 0)
+                for item in summaries.values()
+                if isinstance(item, dict)
+            ),
+            "total_chunked_compact_token_count": sum(
+                item.get("chunked_compact_token_count", 0)
+                for item in summaries.values()
+                if isinstance(item, dict)
+            ),
+            "total_chunked_compact_full_token_count": sum(
+                item.get("chunked_compact_full_token_count", 0)
+                for item in summaries.values()
+                if isinstance(item, dict)
+            ),
             "total_no_shrink_skipped_layers": sum(
                 item.get("skip_reason") == "no_shrink"
                 for item in summaries.values()

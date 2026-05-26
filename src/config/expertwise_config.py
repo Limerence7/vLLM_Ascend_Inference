@@ -15,6 +15,8 @@ class ExpertWiseConfig:
     skip_no_shrink_compact: bool = False
     enable_large_batch_fast_path: bool = True
     enable_single_select_forward: bool = True
+    enable_chunked_compact_forward: bool = True
+    enable_compact_chunk_token_filter: bool = False
     large_batch_active_ratio: float = 0.8
     log_transfers: bool = False
     max_transfer_logs: int = 32

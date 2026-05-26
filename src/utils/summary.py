@@ -109,6 +109,12 @@ def _compact_summary(summary: dict) -> dict:
     layer_items = [
         item for item in layers.values() if isinstance(item, dict)
     ]
+    compact_sizing_items = [
+        item.get("compact_sizing")
+        for item in layer_items
+        if isinstance(item.get("compact_sizing"), dict)
+    ]
+    compact_sizing_examples = compact_sizing_items[:3]
     return {
         "mode": "expert_wise",
         "num_layers": len(layer_items),
@@ -121,6 +127,22 @@ def _compact_summary(summary: dict) -> dict:
         ),
         "total_prefetch_capacity_skips": summary.get(
             "total_prefetch_capacity_skips",
+            0,
+        ),
+        "total_chunked_compact_forward_count": summary.get(
+            "total_chunked_compact_forward_count",
+            0,
+        ),
+        "total_chunked_compact_piece_count": summary.get(
+            "total_chunked_compact_piece_count",
+            0,
+        ),
+        "total_chunked_compact_token_count": summary.get(
+            "total_chunked_compact_token_count",
+            0,
+        ),
+        "total_chunked_compact_full_token_count": summary.get(
+            "total_chunked_compact_full_token_count",
             0,
         ),
         "total_no_shrink_skipped_layers": summary.get(
@@ -144,4 +166,5 @@ def _compact_summary(summary: dict) -> dict:
         "offloaded_layers": sum(
             1 for item in layer_items if item.get("offloaded_experts")
         ),
+        "compact_sizing_examples": compact_sizing_examples,
     }

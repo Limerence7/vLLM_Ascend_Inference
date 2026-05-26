@@ -1,4 +1,5 @@
 import re
+from contextlib import contextmanager
 from types import MethodType
 from typing import Dict, Optional, Set
 
@@ -48,8 +49,13 @@ class ExpertWiseAscendFusedMoE(AscendFusedMoE):
         self.prefetcher = ExpertWisePrefetcher(self.expert_manager)
         self.routing_select_count = 0
         self.routing_large_batch_fast_path_count = 0
+        self.chunked_compact_forward_count = 0
+        self.chunked_compact_piece_count = 0
+        self.chunked_compact_token_count = 0
+        self.chunked_compact_full_token_count = 0
         self._expert_wise_single_select_active = False
         self.expert_wise_skip_reason = None
+        self.expert_wise_compact_sizing = {}
         self.expert_manager.register_layer(self.decoder_layer_idx, self)
 
         self.expert_wise_enabled = (
@@ -124,7 +130,15 @@ class ExpertWiseAscendFusedMoE(AscendFusedMoE):
             return False
 
         resident_local_count = len(local_global_to_slot) - len(local_offloaded_experts)
-        if len(local_offloaded_experts) > config.npu_cache_capacity:
+        self._record_compact_sizing(
+            resident_local_count=resident_local_count,
+            offloaded_local_count=len(local_offloaded_experts),
+            original_local_slots=len(local_global_to_slot),
+        )
+        if (
+            len(local_offloaded_experts) > config.npu_cache_capacity
+            and not config.enable_chunked_compact_forward
+        ):
             self.expert_wise_enabled = False
             self.expert_wise_skip_reason = "capacity_unsafe"
             global _CAPACITY_UNSAFE_SKIP_WARNED
@@ -161,6 +175,27 @@ class ExpertWiseAscendFusedMoE(AscendFusedMoE):
                 "Disable SKIP_NO_SHRINK_COMPACT to force compact rebuild."
             )
         return True
+
+    def _record_compact_sizing(
+        self,
+        *,
+        resident_local_count: int,
+        offloaded_local_count: int,
+        original_local_slots: int,
+    ) -> None:
+        max_cache_capacity_for_shrink = max(0, offloaded_local_count - 1)
+        self.expert_wise_compact_sizing = {
+            "resident_local": resident_local_count,
+            "offloaded_local": offloaded_local_count,
+            "cache_capacity": self.expert_wise_config.npu_cache_capacity,
+            "original_local_slots": original_local_slots,
+            "compact_slots": (
+                resident_local_count
+                + self.expert_wise_config.npu_cache_capacity
+            ),
+            "max_cache_capacity_for_shrink": max_cache_capacity_for_shrink,
+            "min_cache_capacity_for_full_restore": offloaded_local_count,
+        }
 
     def _selected_global_expert_ids(self) -> Set[int]:
         if not self.expert_wise_enabled:
@@ -210,8 +245,17 @@ class ExpertWiseAscendFusedMoE(AscendFusedMoE):
         summary["routing_large_batch_fast_path_count"] = (
             self.routing_large_batch_fast_path_count
         )
+        summary["chunked_compact_forward_count"] = (
+            self.chunked_compact_forward_count
+        )
+        summary["chunked_compact_piece_count"] = self.chunked_compact_piece_count
+        summary["chunked_compact_token_count"] = self.chunked_compact_token_count
+        summary["chunked_compact_full_token_count"] = (
+            self.chunked_compact_full_token_count
+        )
         summary["skip_reason"] = self.expert_wise_skip_reason
         summary["partition_scope"] = self.expert_wise_config.partition_scope
+        summary["compact_sizing"] = self.expert_wise_compact_sizing
         return summary
 
     def prefetch_all_offloaded_experts(self) -> None:
@@ -288,7 +332,10 @@ class ExpertWiseAscendFusedMoE(AscendFusedMoE):
             return False
         if self.expert_store.is_compact():
             offloaded_count = len(self.expert_store.offloaded_expert_ids())
-            if offloaded_count > config.npu_cache_capacity:
+            if (
+                offloaded_count > config.npu_cache_capacity
+                and not config.enable_chunked_compact_forward
+            ):
                 return False
         if self.multistream_overlap_gate:
             return False
@@ -328,6 +375,14 @@ class ExpertWiseAscendFusedMoE(AscendFusedMoE):
 
         forward_context = get_forward_context()
         if forward_context.in_profile_run:
+            if self.expert_store.is_compact():
+                dispatcher = activate_compact_allgather_dispatch(
+                    num_compact_slots=int(self.w13_weight.shape[0]),
+                )
+                try:
+                    return super().forward_impl(hidden_states, router_logits)
+                finally:
+                    deactivate_compact_allgather_dispatch(dispatcher)
             return super().forward_impl(hidden_states, router_logits)
 
         hidden_states, router_logits, mc2_mask, context_metadata = (
@@ -371,6 +426,27 @@ class ExpertWiseAscendFusedMoE(AscendFusedMoE):
             current_offloaded_experts=current_offloaded_experts,
         )
 
+        if self._should_use_chunked_compact_forward(plan):
+            final_hidden_states = self._chunked_compact_fused_experts(
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                routed_experts=routed_experts,
+                current_offloaded_experts=current_offloaded_experts,
+                mc2_mask=mc2_mask,
+                pertoken_scale=pertoken_scale,
+            )
+            self.prefetcher.schedule_next(
+                self.decoder_layer_idx,
+                routed_experts,
+                plan,
+            )
+            return forward_context.moe_comm_method.finalize(
+                hidden_states=final_hidden_states,
+                reduce_results=self.reduce_results,
+                context_metadata=context_metadata,
+            )
+
         self.expert_loader.load_for_compute(self, plan.load_experts)
         self.prefetcher.schedule_next(
             self.decoder_layer_idx,
@@ -406,6 +482,209 @@ class ExpertWiseAscendFusedMoE(AscendFusedMoE):
             reduce_results=self.reduce_results,
             context_metadata=context_metadata,
         )
+
+    def _should_use_chunked_compact_forward(self, plan) -> bool:
+        config = self.expert_wise_config
+        return (
+            config.enable_chunked_compact_forward
+            and self.expert_store.is_compact()
+            and config.npu_cache_capacity > 0
+            and len(plan.load_experts) > config.npu_cache_capacity
+        )
+
+    def _chunked_compact_fused_experts(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        routed_experts: Set[int],
+        current_offloaded_experts: Set[int],
+        mc2_mask,
+        pertoken_scale,
+    ):
+        resident_experts = routed_experts.difference(current_offloaded_experts)
+        offloaded_experts = sorted(
+            routed_experts.intersection(current_offloaded_experts)
+        )
+        chunks = self._chunk_compact_forward_experts(
+            resident_experts=resident_experts,
+            offloaded_experts=offloaded_experts,
+            chunk_size=self.expert_wise_config.npu_cache_capacity,
+        )
+        self.chunked_compact_forward_count += 1
+        self.chunked_compact_piece_count += len(chunks)
+
+        output = None
+        for allowed_experts in chunks:
+            load_experts = allowed_experts.intersection(current_offloaded_experts)
+            if load_experts:
+                self.expert_loader.load_for_compute(self, load_experts)
+            partial = self._fused_experts_for_allowed_experts(
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                allowed_experts=allowed_experts,
+                mc2_mask=mc2_mask,
+                pertoken_scale=pertoken_scale,
+            )
+            output = partial if output is None else output + partial
+
+        if output is None:
+            return torch.zeros_like(hidden_states)
+        return output
+
+    @staticmethod
+    def _chunk_expert_ids(expert_ids, chunk_size: int):
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be > 0.")
+        return [
+            set(expert_ids[index:index + chunk_size])
+            for index in range(0, len(expert_ids), chunk_size)
+        ]
+
+    @classmethod
+    def _chunk_compact_forward_experts(
+        cls,
+        *,
+        resident_experts: Set[int],
+        offloaded_experts,
+        chunk_size: int,
+    ):
+        offloaded_chunks = cls._chunk_expert_ids(offloaded_experts, chunk_size)
+        if not resident_experts:
+            return offloaded_chunks
+        if not offloaded_chunks:
+            return [set(resident_experts)]
+
+        chunks = [set(resident_experts).union(offloaded_chunks[0])]
+        chunks.extend(offloaded_chunks[1:])
+        return chunks
+
+    def _fused_experts_for_allowed_experts(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        allowed_experts: Set[int],
+        mc2_mask,
+        pertoken_scale,
+    ):
+        membership_mask = self._expert_membership_mask(topk_ids, allowed_experts)
+        masked_topk_weights = topk_weights * membership_mask.to(topk_weights.dtype)
+        row_mask = None
+        selected_tokens = int(hidden_states.shape[0])
+        total_tokens = selected_tokens
+        if self.expert_wise_config.enable_compact_chunk_token_filter:
+            row_mask = membership_mask.any(dim=-1)
+            selected_tokens = int(row_mask.sum().item())
+            total_tokens = int(row_mask.numel())
+            if selected_tokens == 0:
+                self.chunked_compact_full_token_count += total_tokens
+                return torch.zeros_like(hidden_states)
+            if selected_tokens != total_tokens:
+                (
+                    hidden_states,
+                    masked_topk_weights,
+                    topk_ids,
+                    mc2_mask,
+                    pertoken_scale,
+                ) = self._select_compact_chunk_tokens(
+                    row_mask=row_mask,
+                    hidden_states=hidden_states,
+                    topk_weights=masked_topk_weights,
+                    topk_ids=topk_ids,
+                    mc2_mask=mc2_mask,
+                    pertoken_scale=pertoken_scale,
+                )
+        self.chunked_compact_token_count += selected_tokens
+        self.chunked_compact_full_token_count += total_tokens
+
+        with self._compact_expert_map_for(allowed_experts):
+            dispatcher = activate_compact_allgather_dispatch(
+                num_compact_slots=int(self.w13_weight.shape[0]),
+            )
+            try:
+                partial = get_forward_context().moe_comm_method.fused_experts(
+                    hidden_states=hidden_states,
+                    w1=self.w13_weight,
+                    w2=self.w2_weight,
+                    topk_weights=masked_topk_weights,
+                    topk_ids=topk_ids,
+                    global_num_experts=self.global_num_experts,
+                    expert_map=self.expert_map,
+                    shared_experts=None,
+                    apply_router_weight_on_input=self.apply_router_weight_on_input,
+                    dynamic_eplb=False,
+                    mc2_mask=mc2_mask,
+                    pertoken_scale=pertoken_scale,
+                )
+            finally:
+                deactivate_compact_allgather_dispatch(dispatcher)
+        if row_mask is None or selected_tokens == total_tokens:
+            return partial
+
+        output = torch.zeros(
+            total_tokens,
+            partial.shape[-1],
+            device=partial.device,
+            dtype=partial.dtype,
+        )
+        output[row_mask] = partial
+        return output
+
+    @classmethod
+    def _select_compact_chunk_tokens(
+        cls,
+        *,
+        row_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        mc2_mask,
+        pertoken_scale,
+    ):
+        return (
+            hidden_states[row_mask],
+            topk_weights[row_mask],
+            topk_ids[row_mask],
+            cls._select_optional_token_tensor(mc2_mask, row_mask),
+            cls._select_optional_token_tensor(pertoken_scale, row_mask),
+        )
+
+    @staticmethod
+    def _select_optional_token_tensor(value, row_mask: torch.Tensor):
+        if not isinstance(value, torch.Tensor):
+            return value
+        if value.ndim == 0 or value.shape[0] != row_mask.numel():
+            return value
+        return value[row_mask]
+
+    @staticmethod
+    def _expert_membership_mask(
+        topk_ids: torch.Tensor,
+        allowed_experts: Set[int],
+    ) -> torch.Tensor:
+        mask = torch.zeros_like(topk_ids, dtype=torch.bool)
+        for expert_id in allowed_experts:
+            mask |= topk_ids == int(expert_id)
+        return mask
+
+    @contextmanager
+    def _compact_expert_map_for(self, allowed_experts: Set[int]):
+        original_expert_map = self._expert_map
+        compact_expert_map = torch.full_like(original_expert_map, -1)
+        for expert_id in allowed_experts:
+            if 0 <= int(expert_id) < int(original_expert_map.numel()):
+                compact_expert_map[int(expert_id)] = original_expert_map[
+                    int(expert_id)
+                ]
+        self._expert_map = compact_expert_map
+        try:
+            yield
+        finally:
+            self._expert_map = original_expert_map
 
     def _build_expert_plan(
         self,
