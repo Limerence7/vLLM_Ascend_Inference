@@ -23,31 +23,38 @@ class CompactAllGatherDispatchPatch:
     def __init__(self, *, num_compact_slots: int):
         self.num_compact_slots = int(num_compact_slots)
         self._dispatcher = None
-        self._original_token_dispatch = None
 
     def __enter__(self):
-        moe_comm_method = get_forward_context().moe_comm_method
-        if not isinstance(moe_comm_method, AllGatherCommImpl):
-            raise RuntimeError(
-                "compact_npu_cache shrink currently supports only the "
-                "AllGather MoE communication backend."
-            )
-
-        self._dispatcher = moe_comm_method.token_dispatcher
-        self._original_token_dispatch = self._dispatcher.token_dispatch
-        self._dispatcher._expert_wise_compact_slots = self.num_compact_slots
-        self._dispatcher.token_dispatch = MethodType(
-            _compact_allgather_token_dispatch,
-            self._dispatcher,
-        )
+        self._dispatcher = activate_compact_allgather_dispatch(self.num_compact_slots)
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self._dispatcher is not None:
-            self._dispatcher.token_dispatch = self._original_token_dispatch
-            if hasattr(self._dispatcher, "_expert_wise_compact_slots"):
-                delattr(self._dispatcher, "_expert_wise_compact_slots")
+        deactivate_compact_allgather_dispatch(self._dispatcher)
         return False
+
+
+def activate_compact_allgather_dispatch(*, num_compact_slots: int):
+    moe_comm_method = get_forward_context().moe_comm_method
+    if not isinstance(moe_comm_method, AllGatherCommImpl):
+        raise RuntimeError(
+            "compact_npu_cache shrink currently supports only the "
+            "AllGather MoE communication backend."
+        )
+
+    dispatcher = moe_comm_method.token_dispatcher
+    if not hasattr(dispatcher, "_expert_wise_original_token_dispatch"):
+        dispatcher._expert_wise_original_token_dispatch = dispatcher.token_dispatch
+        dispatcher.token_dispatch = MethodType(
+            _compact_allgather_token_dispatch,
+            dispatcher,
+        )
+    dispatcher._expert_wise_compact_slots = int(num_compact_slots)
+    return dispatcher
+
+
+def deactivate_compact_allgather_dispatch(dispatcher) -> None:
+    if dispatcher is not None and hasattr(dispatcher, "_expert_wise_compact_slots"):
+        delattr(dispatcher, "_expert_wise_compact_slots")
 
 
 def _compact_allgather_token_dispatch(
@@ -67,6 +74,25 @@ def _compact_allgather_token_dispatch(
     dynamic_eplb: bool = False,
     pertoken_scale: Optional[torch.Tensor] = None,
 ):
+    num_compact_slots = getattr(self, "_expert_wise_compact_slots", None)
+    if num_compact_slots is None:
+        return self._expert_wise_original_token_dispatch(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+            log2phy=log2phy,
+            global_redundant_expert_num=global_redundant_expert_num,
+            shared_experts=shared_experts,
+            quantized_x_for_share=quantized_x_for_share,
+            dynamic_scale_for_share=dynamic_scale_for_share,
+            mc2_mask=mc2_mask,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            with_quant=with_quant,
+            dynamic_eplb=dynamic_eplb,
+            pertoken_scale=pertoken_scale,
+        )
+
     if expert_map is None:
         raise RuntimeError("compact AllGather dispatch requires expert_map.")
     if log2phy is not None:
@@ -87,7 +113,7 @@ def _compact_allgather_token_dispatch(
         assert topk == 1
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
 
-    num_compact_slots = int(self._expert_wise_compact_slots)
+    num_compact_slots = int(num_compact_slots)
     compact_topk_ids = expert_map[topk_ids]
     local_mask = compact_topk_ids != -1
     topk_weights = topk_weights * local_mask

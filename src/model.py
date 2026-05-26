@@ -1,6 +1,7 @@
 from typing import Iterable, Optional, Tuple
 
 import torch
+import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -9,9 +10,49 @@ from vllm.distributed import (
 )
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
 
+from .config import OffloadConfig, get_offload_config
+from .expert_wise import ExpertWiseManager, validate_expert_partition
 from .fused_moe import ExpertWiseAscendFusedMoE
-from .offload.config import get_offload_config
-from .offload.layer_wise import LayerWiseOffloadController
+from .layer_wise import LayerWiseManager
+
+
+_ORIGINAL_QWEN3_FUSED_MOE = None
+
+
+class OffloadModel(nn.Module):
+    def __init__(self, model: nn.Module, offload_config: OffloadConfig):
+        super().__init__()
+        self.model = model
+        self.offload_config = offload_config
+        self.manager = self._build_manager()
+
+    def _build_manager(self):
+        if self.offload_config.mode == "layer_wise":
+            return LayerWiseManager(self.model, self.offload_config)
+        if self.offload_config.mode == "expert_wise":
+            return ExpertWiseManager.activate(self.offload_config)
+        if self.offload_config.mode == "none":
+            return None
+        raise ValueError(f"Unsupported offload mode: {self.offload_config.mode}.")
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def load_weights(self, weights):
+        loaded_weights = self.model.load_weights(weights)
+        self.setup_after_weight_loading()
+        return loaded_weights
+
+    def setup_after_weight_loading(self) -> None:
+        if hasattr(self.manager, "setup_after_weight_loading"):
+            self.manager.setup_after_weight_loading()
+
+    def offload_summary(self):
+        if hasattr(self.manager, "summary"):
+            return self.manager.summary()
+        if self.offload_config.mode == "expert_wise":
+            return ExpertWiseManager.active().summary()
+        return {"mode": self.offload_config.mode}
 
 
 class AscendQwen3MoeModel(Qwen3MoeForCausalLM):
@@ -25,7 +66,11 @@ class AscendQwen3MoeModel(Qwen3MoeForCausalLM):
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        self._patch_qwen3_moe_backend()
+        runtime_offload_config = get_offload_config()
+        if runtime_offload_config.mode == "expert_wise":
+            ExpertWiseManager.activate(runtime_offload_config)
+
+        self._configure_qwen3_moe_backend(runtime_offload_config)
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -33,17 +78,26 @@ class AscendQwen3MoeModel(Qwen3MoeForCausalLM):
         self.config = vllm_config.model_config.hf_text_config
         self.num_layers = self.config.num_hidden_layers
 
-        self.runtime_offload_config = get_offload_config()
+        self.runtime_offload_config = runtime_offload_config
         self.offload_mode = self.runtime_offload_config.mode
-        self.layer_wise_offload: Optional[LayerWiseOffloadController] = None
+        self.offload_manager = None
+        self._validate_model_level_offload_config()
 
         self._log_model_summary("initializing")
 
-    @staticmethod
-    def _patch_qwen3_moe_backend() -> None:
+    @classmethod
+    def _configure_qwen3_moe_backend(cls, config: OffloadConfig) -> None:
         import vllm.model_executor.models.qwen3_moe as qwen3_moe
 
-        qwen3_moe.FusedMoE = ExpertWiseAscendFusedMoE
+        global _ORIGINAL_QWEN3_FUSED_MOE
+        if _ORIGINAL_QWEN3_FUSED_MOE is None:
+            _ORIGINAL_QWEN3_FUSED_MOE = qwen3_moe.FusedMoE
+
+        if config.mode == "expert_wise":
+            qwen3_moe.FusedMoE = ExpertWiseAscendFusedMoE
+            return
+
+        qwen3_moe.FusedMoE = _ORIGINAL_QWEN3_FUSED_MOE
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         loaded_weights = super().load_weights(weights)
@@ -59,21 +113,32 @@ class AscendQwen3MoeModel(Qwen3MoeForCausalLM):
             print("[Plugin] Qwen3 expert-wise offload is handled by FusedMoE.")
             return
 
-        if self.offload_mode not in {"layer_wise", "auto"}:
+        if self.offload_mode != "layer_wise":
             raise ValueError(f"Unsupported offload mode: {self.offload_mode}.")
 
-        if self.offload_mode == "auto":
-            print(
-                "[Plugin] Qwen3 auto offload strategy is not implemented; "
-                "falling back to layer-wise config."
-            )
-
-        if self.layer_wise_offload is None:
-            self.layer_wise_offload = LayerWiseOffloadController(
+        if self.offload_manager is None:
+            self.offload_manager = LayerWiseManager(
                 model=self,
-                config=self.runtime_offload_config.layer_wise,
+                config=self.runtime_offload_config,
             )
-        self.layer_wise_offload.setup_after_weight_loading()
+        self.offload_manager.setup_after_weight_loading()
+
+    def offload_summary(self):
+        if self.offload_mode == "expert_wise":
+            return ExpertWiseManager.active().summary()
+        if self.offload_manager is not None:
+            return self.offload_manager.summary()
+        return {"mode": self.offload_mode}
+
+    def _validate_model_level_offload_config(self) -> None:
+        if self.offload_mode != "expert_wise":
+            return
+
+        validate_expert_partition(
+            resident_experts=self.runtime_offload_config.expert_wise.resident_experts,
+            total_experts=int(self.config.num_experts),
+            offload_multiple=self.runtime_offload_config.expert_wise.offload_multiple,
+        )
 
     def _log_model_summary(self, phase: str) -> None:
         cfg = self.config

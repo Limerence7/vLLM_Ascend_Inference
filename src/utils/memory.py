@@ -8,11 +8,6 @@ import torch_npu
 
 
 class ExpertOffloadSlot:
-    """
-    One CPU pinned expert-weight slot for one offloaded MoE layer.
-    CPU -> NPU copy is performed by ExpertBufferPool.
-    """
-
     def __init__(
         self,
         layer_idx: int,
@@ -25,6 +20,12 @@ class ExpertOffloadSlot:
             experts_module=experts_module,
             target_module=target_module,
             pin_cpu_memory=pin_cpu_memory,
+        )
+
+    def nbytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.cpu_state.values()
         )
 
     @classmethod
@@ -45,8 +46,19 @@ class ExpertOffloadSlot:
                 raise RuntimeError(
                     f"Target expert buffer does not have state key {name}."
                 )
-            if cpu_tensor.ndim == 3:
-                cpu_tensor = cpu_tensor.transpose(1, 2).contiguous()
+            if tuple(cpu_tensor.shape) != tuple(target_tensor.shape):
+                if (
+                    cpu_tensor.ndim == 3
+                    and tuple(cpu_tensor.transpose(1, 2).shape)
+                    == tuple(target_tensor.shape)
+                ):
+                    cpu_tensor = cpu_tensor.transpose(1, 2).contiguous()
+                else:
+                    raise RuntimeError(
+                        f"Expert tensor shape mismatch for {name}, layer "
+                        f"registration: cpu={tuple(cpu_tensor.shape)}, "
+                        f"target={tuple(target_tensor.shape)}."
+                    )
             if pin_cpu_memory:
                 cpu_tensor = cpu_tensor.pin_memory()
 
@@ -75,24 +87,14 @@ class ExpertBuffer:
 
 
 class ExpertBufferPool:
-    """
-    Shared NPU expert buffer pool.
-
-    State semantics:
-    - loaded_layer: layer logically resident in the buffer.
-    - loading_layer: CPU -> NPU copy has been issued but not finalized by
-      compute stream.
-    - ready_event: event recorded on the copy/prefetch stream.
-    - in_use: buffer is currently used by one forward.
-    """
-
     def __init__(
         self,
         buffers: List[ExpertBuffer],
         prefetch_stream: torch_npu.npu.Stream,
         enable_prefetch: bool = True,
     ):
-        assert len(buffers) >= 1, "Length of buffers must be at least 1."
+        if len(buffers) < 1:
+            raise ValueError("ExpertBufferPool requires at least one buffer.")
         self.buffers = buffers
         self.prefetch_stream = prefetch_stream
         self.enable_prefetch = enable_prefetch
@@ -100,9 +102,6 @@ class ExpertBufferPool:
 
     def __len__(self) -> int:
         return len(self.buffers)
-
-    def first_module(self) -> nn.Module:
-        return self.buffers[0].experts
 
     def get_loaded_or_loading(self, layer_idx: int) -> Optional[ExpertBuffer]:
         for buf in self.buffers:
@@ -145,13 +144,21 @@ class ExpertBufferPool:
                         f"{slot.layer_idx}."
                     )
                 target_tensor = shared_state[name]
-                if tuple(target_tensor.shape) != tuple(cpu_tensor.shape):
-                    raise RuntimeError(
-                        f"Expert tensor shape mismatch for {name}, layer "
-                        f"{slot.layer_idx}: cpu={tuple(cpu_tensor.shape)}, "
-                        f"npu={tuple(target_tensor.shape)}."
-                    )
-                target_tensor.copy_(cpu_tensor, non_blocking=True)
+                source_tensor = cpu_tensor
+                if tuple(target_tensor.shape) != tuple(source_tensor.shape):
+                    if (
+                        source_tensor.ndim == 3
+                        and tuple(source_tensor.transpose(1, 2).shape)
+                        == tuple(target_tensor.shape)
+                    ):
+                        source_tensor = source_tensor.transpose(1, 2).contiguous()
+                    else:
+                        raise RuntimeError(
+                            f"Expert tensor shape mismatch for {name}, layer "
+                            f"{slot.layer_idx}: cpu={tuple(cpu_tensor.shape)}, "
+                            f"npu={tuple(target_tensor.shape)}."
+                        )
+                target_tensor.copy_(source_tensor, non_blocking=True)
 
             event = torch_npu.npu.Event()
             event.record(stream)
@@ -159,6 +166,16 @@ class ExpertBufferPool:
         buf.loaded_layer = slot.layer_idx
         buf.loading_layer = slot.layer_idx
         buf.ready_event = event
+
+    def mark_loaded(self, layer_idx: int, buf_idx: int = 0) -> None:
+        with self.lock:
+            for buf in self.buffers:
+                if buf.idx == buf_idx:
+                    buf.loaded_layer = layer_idx
+                    buf.loading_layer = None
+                    buf.ready_event = None
+                    return
+        raise RuntimeError(f"Expert buffer {buf_idx} does not exist.")
 
     def _wait_and_finalize(self, buf: ExpertBuffer) -> None:
         event = buf.ready_event
@@ -177,13 +194,6 @@ class ExpertBufferPool:
         layer_idx: int,
         slot: ExpertOffloadSlot,
     ) -> ExpertBuffer:
-        """
-        Return an NPU expert buffer loaded with the current layer.
-
-        If prefetch already loaded the layer, reuse it and wait for its event.
-        Otherwise copy the slot into an idle buffer on the current stream.
-        """
-
         with self.lock:
             buf = self.get_loaded_or_loading(layer_idx)
             if buf is None:
@@ -200,7 +210,7 @@ class ExpertBufferPool:
             if buf is None:
                 raise RuntimeError(
                     f"No free expert buffer for layer {layer_idx}. "
-                    "Increase ExpertOffloadConfig.num_buffers or check "
+                    "Increase LayerWiseConfig.cpu_cache_size or check "
                     "overlapping MoE forwards."
                 )
 
@@ -219,11 +229,6 @@ class ExpertBufferPool:
         slot: ExpertOffloadSlot,
         avoid: Optional[ExpertBuffer] = None,
     ) -> bool:
-        """
-        Asynchronously prefetch layer_idx into a buffer different from the
-        currently computing one when possible.
-        """
-
         if not self.enable_prefetch or len(self.buffers) < 2:
             return False
 
@@ -247,5 +252,6 @@ class ExpertBufferPool:
                 )
             except Exception:
                 buf.reset()
+                raise
 
             return True

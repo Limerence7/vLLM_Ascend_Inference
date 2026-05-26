@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Optional, Set
+from typing import AbstractSet, Callable, Dict, Iterable, Optional, Set
 
 import torch
 import torch.nn as nn
+import torch_npu
 
-from .config import ExpertWiseOffloadConfig
+from ..config import ExpertWiseConfig
+
+_NO_SHRINK_COMPACT_WARNED = False
 
 
 @dataclass(frozen=True)
@@ -18,23 +21,16 @@ class ExpertPlacement:
 
 
 class ExpertWiseExpertStore:
-    """
-    CPU expert store plus logical NPU cache state for one FusedMoE layer.
-
-    By default this copies selected experts back into AscendFusedMoE's dense
-    local expert slices. When compact_npu_cache is enabled, the dense local
-    expert tensor is replaced by resident slots plus finite cache slots.
-    """
-
     def __init__(
         self,
         *,
         layer_idx: Optional[int],
-        config: ExpertWiseOffloadConfig,
+        config: ExpertWiseConfig,
     ):
         self.layer_idx = layer_idx
         self.config = config
         self.cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._offloaded_expert_ids: AbstractSet[int] = frozenset()
         self.placements: Dict[int, ExpertPlacement] = {}
         self.loaded_experts: Set[int] = set()
         self.cache_lru: OrderedDict[int, None] = OrderedDict()
@@ -48,6 +44,11 @@ class ExpertWiseExpertStore:
         self.resident_experts: Set[int] = set()
         self.cache_slots: OrderedDict[int, int] = OrderedDict()
         self.free_cache_slots: list[int] = []
+        self.prefetch_stream = torch_npu.npu.Stream()
+        self.prefetch_events: Dict[int, torch_npu.npu.Event] = {}
+        self.prefetch_count = 0
+        self.prefetch_wait_count = 0
+        self.prefetch_capacity_skips = 0
 
     @property
     def enabled(self) -> bool:
@@ -74,6 +75,7 @@ class ExpertWiseExpertStore:
                 local_expert_id=local_expert_id,
                 device="cpu",
             )
+        self._offloaded_expert_ids = frozenset(self.cpu_weights)
 
     @torch.no_grad()
     def maybe_compact_npu_weights(self, fused_moe) -> None:
@@ -94,6 +96,23 @@ class ExpertWiseExpertStore:
         ]
         cache_capacity = self.config.npu_cache_capacity
         total_slots = len(resident_experts) + cache_capacity
+        original_local_slots = len(local_global_to_slot)
+        if total_slots >= original_local_slots:
+            global _NO_SHRINK_COMPACT_WARNED
+            if not _NO_SHRINK_COMPACT_WARNED:
+                _NO_SHRINK_COMPACT_WARNED = True
+                print(
+                    "[Plugin] Expert-wise compact NPU cache has no HBM shrink "
+                    "for this rank: "
+                    f"resident_local={len(resident_experts)}, "
+                    f"cache_capacity={cache_capacity}, "
+                    f"original_local_slots={original_local_slots}. "
+                    "Lower RESIDENT_EXPERTS/NPU_CACHE_CAPACITY for memory "
+                    "savings, or set SKIP_NO_SHRINK_COMPACT=1 to skip the "
+                    "compact tensor rebuild on no-shrink ranks."
+                )
+            if self.config.skip_no_shrink_compact:
+                return
         if total_slots <= 0:
             raise RuntimeError("compact_npu_cache needs at least one NPU slot.")
 
@@ -165,7 +184,16 @@ class ExpertWiseExpertStore:
         )
 
     @torch.no_grad()
-    def restore_routed_experts(self, fused_moe, routed_global_expert_ids: Set[int]) -> None:
+    def restore_routed_experts(
+        self,
+        fused_moe,
+        routed_global_expert_ids: AbstractSet[int],
+    ) -> None:
+        if self.experts_ready(routed_global_expert_ids):
+            return
+
+        self.wait_for_prefetch(routed_global_expert_ids)
+
         if self.compact_enabled:
             self._restore_routed_experts_compact(fused_moe, routed_global_expert_ids)
             return
@@ -174,16 +202,57 @@ class ExpertWiseExpertStore:
             if global_expert_id not in self.cpu_weights:
                 continue
 
-            if (
-                self.config.keep_loaded_on_npu
-                and global_expert_id in self.loaded_experts
-            ):
+            if global_expert_id in self.loaded_experts:
                 self.cache_hits += 1
                 self._touch_cached_expert(global_expert_id)
                 continue
 
             self.cache_misses += 1
             self._copy_cpu_expert_to_npu(fused_moe, global_expert_id)
+
+    @torch.no_grad()
+    def prefetch_experts(self, fused_moe, expert_ids: AbstractSet[int]) -> None:
+        target_experts = {
+            expert_id
+            for expert_id in expert_ids
+            if expert_id in self.cpu_weights
+            and expert_id not in self.loaded_experts
+            and expert_id not in self.prefetch_events
+        }
+        if not target_experts:
+            return
+        if (
+            self.compact_enabled
+            and len(target_experts) > self.config.npu_cache_capacity
+        ):
+            self.prefetch_capacity_skips += 1
+            return
+
+        with torch_npu.npu.stream(self.prefetch_stream):
+            if self.compact_enabled:
+                self._restore_routed_experts_compact(fused_moe, target_experts)
+            else:
+                for global_expert_id in sorted(target_experts):
+                    self.cache_misses += 1
+                    self._copy_cpu_expert_to_npu(fused_moe, global_expert_id)
+
+            event = torch_npu.npu.Event()
+            event.record(self.prefetch_stream)
+
+        for global_expert_id in target_experts.intersection(self.loaded_experts):
+            self.prefetch_events[global_expert_id] = event
+            self.prefetch_count += 1
+
+    def wait_for_prefetch(self, expert_ids: AbstractSet[int]) -> None:
+        unique_events: Dict[int, torch_npu.npu.Event] = {}
+        for expert_id in expert_ids:
+            event = self.prefetch_events.pop(expert_id, None)
+            if event is not None:
+                unique_events[id(event)] = event
+
+        for event in unique_events.values():
+            torch_npu.npu.current_stream().wait_event(event)
+            self.prefetch_wait_count += 1
 
     def mark_loaded_experts_evicted_if_needed(self, fused_moe=None) -> None:
         if self.config.keep_loaded_on_npu:
@@ -201,6 +270,7 @@ class ExpertWiseExpertStore:
                 )
                 self.loaded_experts.discard(global_expert_id)
                 self.global_to_slot.pop(global_expert_id, None)
+                self.prefetch_events.pop(global_expert_id, None)
                 self.free_cache_slots.append(slot)
             self.cache_slots.clear()
             return
@@ -210,8 +280,17 @@ class ExpertWiseExpertStore:
         self.loaded_experts.clear()
         self.cache_lru.clear()
 
-    def offloaded_expert_ids(self) -> Set[int]:
-        return set(self.cpu_weights)
+    def offloaded_expert_ids(self) -> AbstractSet[int]:
+        return self._offloaded_expert_ids
+
+    def experts_ready(self, expert_ids: AbstractSet[int]) -> bool:
+        if not expert_ids:
+            return True
+        if not self.config.keep_loaded_on_npu:
+            return False
+        if not expert_ids.issubset(self.loaded_experts):
+            return False
+        return not any(expert_id in self.prefetch_events for expert_id in expert_ids)
 
     def is_compact(self) -> bool:
         return self.compact_enabled
@@ -221,13 +300,25 @@ class ExpertWiseExpertStore:
             "layer": self.layer_idx,
             "offloaded_experts": sorted(self.cpu_weights),
             "loaded_experts": sorted(self.loaded_experts),
+            "prefetching_experts": sorted(self.prefetch_events),
+            "cpu_store_bytes": self.cpu_store_bytes(),
             "placements": self.placements,
             "copy_count": self.copy_count,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "evictions": self.evictions,
+            "prefetch_count": self.prefetch_count,
+            "prefetch_wait_count": self.prefetch_wait_count,
+            "prefetch_capacity_skips": self.prefetch_capacity_skips,
             "compact_enabled": self.compact_enabled,
         }
+
+    def cpu_store_bytes(self) -> int:
+        total = 0
+        for weights in self.cpu_weights.values():
+            for tensor in weights.values():
+                total += tensor.numel() * tensor.element_size()
+        return total
 
     @staticmethod
     def _local_global_to_slot(expert_map: torch.Tensor) -> Dict[int, int]:
@@ -241,9 +332,9 @@ class ExpertWiseExpertStore:
     def _restore_routed_experts_compact(
         self,
         fused_moe,
-        routed_global_expert_ids: Set[int],
+        routed_global_expert_ids: AbstractSet[int],
     ) -> None:
-        routed = set(routed_global_expert_ids)
+        routed = routed_global_expert_ids
         if len(routed) > self.config.npu_cache_capacity:
             raise RuntimeError(
                 "Routed offloaded experts exceed compact NPU cache capacity: "
@@ -264,7 +355,11 @@ class ExpertWiseExpertStore:
             )
             self._copy_cpu_expert_to_slot(fused_moe, global_expert_id, slot)
 
-    def _acquire_cache_slot(self, fused_moe, protected_experts: Set[int]) -> int:
+    def _acquire_cache_slot(
+        self,
+        fused_moe,
+        protected_experts: AbstractSet[int],
+    ) -> int:
         if self.free_cache_slots:
             return self.free_cache_slots.pop(0)
 
@@ -276,6 +371,7 @@ class ExpertWiseExpertStore:
             fused_moe._expert_map[evicted_expert_id] = -1
             self.global_to_slot.pop(evicted_expert_id, None)
             self.loaded_experts.discard(evicted_expert_id)
+            self.prefetch_events.pop(evicted_expert_id, None)
             self.placements[evicted_expert_id] = ExpertPlacement(
                 global_expert_id=evicted_expert_id,
                 local_expert_id=slot,
@@ -415,6 +511,7 @@ class ExpertWiseExpertStore:
     def _mark_expert_on_cpu(self, global_expert_id: int) -> None:
         placement = self.placements[global_expert_id]
         self.loaded_experts.discard(global_expert_id)
+        self.prefetch_events.pop(global_expert_id, None)
         if self.compact_enabled:
             self.global_to_slot.pop(global_expert_id, None)
         self.placements[global_expert_id] = ExpertPlacement(
