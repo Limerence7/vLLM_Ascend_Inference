@@ -15,9 +15,9 @@ TEST_CONFIG = {
 
 OFFLOAD_CONFIG = OffloadConfig(
     mode="expert_wise",
-    interval=24,
+    interval=16,
     num_buffers=2,
-    num_hot_experts=0,
+    num_hot_experts=64,
     cpu_pin_memory=True,
     offloaded_layer_ids=[],
 )

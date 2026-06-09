@@ -11,7 +11,7 @@ from vllm import LLM, SamplingParams
 Inference_Config = {
     "Qwen3-30B-A3B": {
         "model_path": "/workspace/models/Qwen3-30B-A3B",
-        "batch_size": 1024,
+        "batch_size": 256,
         "max_length": 256,
         "max_new_tokens": 256,
         "world_size": 2,

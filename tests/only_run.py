@@ -23,6 +23,44 @@ OFFLOAD_CONFIG = OffloadConfig(
     offloaded_layer_ids=[],
 )
 
+# TEST_CONFIG = {
+#     "model_path": "/workspace/models/Qwen3-235B-A22B",
+#     "batch_size": 32,
+#     "max_length": 32,
+#     "max_new_tokens": 4,
+#     "world_size": 8,
+#     "utilization": 0.98,
+# }
+
+# OFFLOAD_CONFIG = OffloadConfig(
+#     mode="expert_wise",
+#     interval=16,
+#     num_buffers=2,
+#     num_hot_experts=8,
+#     cpu_pin_memory=True,
+#     offloaded_layer_ids=[],
+# )
+
+# TEST_CONFIG = {
+#     "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
+#     "batch_size": 1,
+#     "max_length": 32,
+#     "max_new_tokens": 4,
+#     "max_num_batched_tokens": 64,
+#     "max_num_seqs": 1,
+#     "world_size": 8,
+#     "utilization": 0.85,
+# }
+
+# OFFLOAD_CONFIG = OffloadConfig(
+#     mode="expert_wise",
+#     interval=16,
+#     num_buffers=2,
+#     num_hot_experts=8,
+#     cpu_pin_memory=True,
+#     offloaded_layer_ids=[],
+# )
+
 
 def build_prompts(batch_size: int, max_length: int) -> list[str]:
     prompt = "User: Explain what expert offloading is in one sentence.\nAssistant:"
@@ -48,9 +86,8 @@ if __name__ == "__main__":
         trust_remote_code=True,
         gpu_memory_utilization=TEST_CONFIG["utilization"],
         max_model_len=TEST_CONFIG["max_length"] + TEST_CONFIG["max_new_tokens"],
-        max_num_batched_tokens=TEST_CONFIG["max_num_batched_tokens"],
-        max_num_seqs=TEST_CONFIG["max_num_seqs"],
         dtype="bfloat16",
+        # quantization='ascend',
         enforce_eager=True,
     )
 

@@ -1,5 +1,5 @@
 import os.path
-from typing import Any, Callable, Optional
+from typing import Callable
 
 import torch
 import vllm.envs as envs
@@ -13,270 +13,38 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig, FusedMoEParallelConfig, RoutingMethodType)
 from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map,
-    get_compressed_expert_map, maybe_roundup_hidden_size)
+    FusedMoE, determine_expert_map, get_compressed_expert_map,
+    maybe_roundup_hidden_size)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import determine_default_log2phy_map
 from vllm_ascend.eplb.utils import moe_load_async_stream
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
-from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.prepare_finalize import QuantType
 from vllm_ascend.quantization.w4a8_dynamic import \
     AscendW4A8DynamicFusedMoEMethod
 from vllm_ascend.quantization.w8a8_dynamic import \
     AscendW8A8DynamicFusedMoEMethod
-from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
-                               maybe_trans_nz, npu_stream_switch)
+from vllm_ascend.utils import npu_stream_switch
 
 from ..offload_config import get_offload_config
-from .routing import (add_routing_output, build_routing_view,
-                      select_optional_rows)
-from .token_dispatcher import dispatch_with_local_experts
-
-
-class OffloadUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
-
-    def __init__(self, moe: FusedMoEConfig = None):
-
-        super().__init__(moe=moe)
-        self.dynamic_eplb = get_ascend_config().dynamic_eplb
-
-    def process_weights_after_loading(self, layer):
-        super(UnquantizedFusedMoEMethod,
-              self).process_weights_after_loading(layer)
-
-        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(
-            1, 2).contiguous()
-        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
-
-        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(
-            1, 2).contiguous()
-        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
-
-        if get_ascend_device_type() != AscendDeviceType._310P:
-            layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
-            layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
-
-        layer.offload_executor.process_layer_after_loading(layer, self)
-
-    def _fused_experts(self, moe_comm_method, hidden_states: torch.Tensor,
-                       w1: torch.Tensor, w2: torch.Tensor,
-                       topk_weights: torch.Tensor, topk_ids: torch.Tensor,
-                       global_num_experts: int,
-                       expert_map: Optional[torch.Tensor],
-                       shared_experts: Optional[Any],
-                       apply_router_weight_on_input: bool,
-                       dynamic_eplb: bool,
-                       mc2_mask: Optional[torch.Tensor]) -> Any:
-        local_num_experts = int(w1.shape[0])
-        with dispatch_with_local_experts(moe_comm_method, local_num_experts):
-            return moe_comm_method.fused_experts(
-                hidden_states=hidden_states,
-                w1=w1,
-                w2=w2,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-                shared_experts=shared_experts,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                dynamic_eplb=dynamic_eplb,
-                mc2_mask=mc2_mask)
-
-    def _apply_split_offload(self, layer: torch.nn.Module,
-                             moe_comm_method, x: torch.Tensor,
-                             topk_weights: torch.Tensor,
-                             topk_ids: torch.Tensor,
-                             cold_experts: torch.nn.Module,
-                             cold_topk_ids: torch.Tensor,
-                             cold_mask: torch.Tensor,
-                             shared_experts: Optional[Any],
-                             apply_router_weight_on_input: bool,
-                             mc2_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        output = torch.zeros_like(x)
-        num_rows = x.size(0)
-
-        hot_topk_ids, hot_mask = layer.build_hot_local_routing(topk_ids,
-                                                               cold_mask)
-        hot_weights = topk_weights.masked_fill(~hot_mask, 0)
-        hot_routing = build_routing_view(
-            hidden_states=x,
-            topk_ids=hot_topk_ids,
-            topk_weights=hot_weights,
-            row_mask=hot_mask.any(dim=1),
-        )
-        if hot_routing is not None:
-            hot_output = self._fused_experts(
-                moe_comm_method=moe_comm_method,
-                hidden_states=hot_routing.hidden_states,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=hot_routing.topk_weights,
-                topk_ids=hot_routing.topk_ids,
-                global_num_experts=layer.resident_local_num_experts,
-                expert_map=None,
-                shared_experts=shared_experts,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                dynamic_eplb=False,
-                mc2_mask=select_optional_rows(mc2_mask,
-                                              hot_routing.row_indices,
-                                              num_rows))
-            add_routing_output(output, hot_routing, hot_output)
-
-        cold_experts.wait()
-        layer.offload_executor.prefetch_next_layers(layer)
-
-        cold_weights = topk_weights.masked_fill(~cold_mask, 0)
-        cold_routing = build_routing_view(
-            hidden_states=x,
-            topk_ids=cold_topk_ids,
-            topk_weights=cold_weights,
-            row_mask=cold_mask.any(dim=1),
-        )
-        if cold_routing is not None:
-            cold_output = self._fused_experts(
-                moe_comm_method=moe_comm_method,
-                hidden_states=cold_routing.hidden_states,
-                w1=cold_experts.w13_weight,
-                w2=cold_experts.w2_weight,
-                topk_weights=cold_routing.topk_weights,
-                topk_ids=cold_routing.topk_ids,
-                global_num_experts=cold_experts.num_experts,
-                expert_map=None,
-                shared_experts=None,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                dynamic_eplb=False,
-                mc2_mask=select_optional_rows(mc2_mask,
-                                              cold_routing.row_indices,
-                                              num_rows))
-            add_routing_output(output, cold_routing, cold_output)
-
-        return output
-
-    def _apply_layer_wise_offload(self, layer: torch.nn.Module,
-                                  moe_comm_method, x: torch.Tensor,
-                                  topk_weights: torch.Tensor,
-                                  topk_ids: torch.Tensor,
-                                  cold_experts: torch.nn.Module,
-                                  shared_experts: Optional[Any],
-                                  apply_router_weight_on_input: bool,
-                                  mc2_mask: Optional[
-                                      torch.Tensor]) -> torch.Tensor:
-        cold_experts.wait()
-        layer.offload_executor.prefetch_next_layers(layer)
-
-        return self._fused_experts(
-            moe_comm_method=moe_comm_method,
-            hidden_states=x,
-            w1=cold_experts.w13_weight,
-            w2=cold_experts.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.full_expert_map,
-            shared_experts=shared_experts,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            dynamic_eplb=False,
-            mc2_mask=mc2_mask)
-
-    def apply(self,
-              layer: torch.nn.Module,
-              x: torch.Tensor,
-              use_grouped_topk: bool,
-              top_k: int,
-              router_logits: torch.Tensor,
-              renormalize: bool,
-              topk_group: Optional[int] = None,
-              num_expert_group: Optional[int] = None,
-              custom_routing_function: Optional[Callable] = None,
-              scoring_func: str = "softmax",
-              routed_scaling_factor: float = 1.0,
-              e_score_correction_bias: Optional[torch.Tensor] = None,
-              global_num_experts: int = -1,
-              expert_map: Optional[torch.Tensor] = None,
-              apply_router_weight_on_input: bool = False,
-              enable_force_load_balance: bool = False,
-              shared_experts: Optional[Any] = None,
-              **kwargs) -> torch.Tensor:
-
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts)
-
-        topk_weights = topk_weights.to(x.dtype)
-        if enable_force_load_balance:
-            random_matrix = torch.rand(topk_ids.size(0),
-                                       global_num_experts,
-                                       device=topk_ids.device)
-            topk_ids = torch.argsort(
-                random_matrix, dim=1)[:, :topk_ids.size(1)].to(topk_ids.dtype)
-
-        moe_comm_method = get_forward_context().moe_comm_method
-        cold_experts = layer.offload_executor.prepare_cold_experts(
-            layer, topk_ids)
-        cold_topk_ids = layer.offload_executor.active_cold_topk_ids
-        cold_mask = layer.offload_executor.active_cold_mask
-
-        mc2_mask = kwargs.get("mc2_mask", None)
-        if (cold_experts is not None
-                and layer.offload_executor.is_full_layer_offload(layer)):
-            return self._apply_layer_wise_offload(
-                layer=layer,
-                moe_comm_method=moe_comm_method,
-                x=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                cold_experts=cold_experts,
-                shared_experts=shared_experts,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                mc2_mask=mc2_mask)
-
-        if cold_experts is None or cold_mask is None or not cold_mask.any():
-            return self._fused_experts(
-                moe_comm_method=moe_comm_method,
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-                shared_experts=shared_experts,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                dynamic_eplb=self.dynamic_eplb,
-                mc2_mask=mc2_mask)
-
-        return self._apply_split_offload(
-            layer=layer,
-            moe_comm_method=moe_comm_method,
-            x=x,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            cold_experts=cold_experts,
-            cold_topk_ids=cold_topk_ids,
-            cold_mask=cold_mask,
-            shared_experts=shared_experts,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            mc2_mask=mc2_mask)
+from .quant_method import (OffloadUnquantizedFusedMoEMethod,
+                           OffloadW8A8DynamicFusedMoEMethod,
+                           wrap_quant_method)
 
 
 class OffloadAscendFusedMoE(FusedMoE):
     moe_counter = -1
-    gate_stream: Optional[torch.npu.Stream] = None
+    gate_stream: torch.npu.Stream | None = None
     executor = None
+
+    @classmethod
+    def reset_runtime(cls) -> None:
+        cls.moe_counter = -1
+        cls.gate_stream = None
+        cls.executor = None
 
     def __init__(
         self,
@@ -422,18 +190,12 @@ class OffloadAscendFusedMoE(FusedMoE):
         self.batched_router_logits = None
 
         self.offload_config = get_offload_config()
-        hf_config = get_current_vllm_config().model_config.hf_text_config
-        self.offload_config.prepare_for_model(
-            num_layers=hf_config.num_hidden_layers,
-            num_experts=getattr(hf_config, "num_experts", None),
-        )
         if OffloadAscendFusedMoE.executor is None:
             from ..offload.executor import OffloadExecutor
 
             OffloadAscendFusedMoE.executor = OffloadExecutor(
                 self.offload_config)
         self.offload_executor = OffloadAscendFusedMoE.executor
-        self.expert_memory_manager = self.offload_executor.memory_manager
 
         OffloadAscendFusedMoE.moe_counter += 1
         self.moe_instance_id = OffloadAscendFusedMoE.moe_counter
@@ -449,33 +211,34 @@ class OffloadAscendFusedMoE(FusedMoE):
             self.quant_method = OffloadUnquantizedFusedMoEMethod(
                 self.moe_config)
         else:
-            self.quant_method = self.quant_config.get_quant_method(
-                self, self.layer_name)
+            self.quant_method = wrap_quant_method(
+                self.quant_config.get_quant_method(self, self.layer_name))
 
         assert self.quant_method is not None
+        self.uses_w8a8 = isinstance(self.quant_method,
+                                    OffloadW8A8DynamicFusedMoEMethod)
 
         self.moe_config.tp_group = get_tp_group()
         self.moe_config.dp_group = get_dp_group()
         self.moe_config.ep_group = get_ep_group()
         self.moe_config.mc2_group = get_mc2_group()
         ascend_config = get_ascend_config()
-        self.dynamic_eplb = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
+        self.dynamic_eplb = (
+            ascend_config.dynamic_eplb
+            or ascend_config.expert_map_record_path)
         self.expert_map_path = ascend_config.expert_map_path
         self.global_redundant_expert_num = ascend_config.init_redundancy_expert
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         self.multistream_overlap_gate = False
-        if self.custom_routing_function is None and self.e_score_correction_bias is not None:
+        if (self.custom_routing_function is None
+                and self.e_score_correction_bias is not None):
             vllm_config = get_current_vllm_config()
             self.e_score_correction_bias.data = self.e_score_correction_bias.data.to(
                 dtype=vllm_config.model_config.dtype)
 
-        # init moe.
         self.local_num_experts, self._expert_map, _ = determine_expert_map(
             self.ep_size, self.ep_rank, self.global_num_experts)
-        # TODO: Temporary flag to indicate if static EPLB is enabled. This is a
-        # workaround to bypass a quantization check that fails with float weights.
         init_eplb_enable = False
-        # static eplb initializing with expert_map_path
         if self.expert_map_path and os.path.exists(
                 self.expert_map_path) and os.access(self.expert_map_path,
                                                     os.R_OK):
@@ -497,11 +260,9 @@ class OffloadAscendFusedMoE(FusedMoE):
                     f"Init expert map of mtp/eagle when using sample.{e}")
                 self.log2phy = determine_default_log2phy_map(
                     self.global_num_experts, self.ep_size, self.ep_rank).npu()
-        else:
-            # dynamic eplb initializing with not expert_map_path
-            if self.dynamic_eplb:
-                self.log2phy = determine_default_log2phy_map(
-                    self.global_num_experts, self.ep_size, self.ep_rank).npu()
+        elif self.dynamic_eplb:
+            self.log2phy = determine_default_log2phy_map(
+                self.global_num_experts, self.ep_size, self.ep_rank).npu()
         self.full_expert_map = self._expert_map
         self.full_local_num_experts = int(
             torch.sum(self.full_expert_map != -1).item()
@@ -524,10 +285,7 @@ class OffloadAscendFusedMoE(FusedMoE):
         else:
             self.moe_load = None
 
-        if init_eplb_enable and (
-                not hasattr(self.quant_method, "quant_method")
-                or not isinstance(self.quant_method.quant_method,
-                                  AscendW8A8DynamicFusedMoEMethod)):
+        if init_eplb_enable and not self.uses_w8a8:
             raise ValueError("Eplb supports only w8a8_dynamic quantization.")
 
         self.moe_config.num_experts = self.global_num_experts
@@ -558,9 +316,9 @@ class OffloadAscendFusedMoE(FusedMoE):
         self.quant_type = self._get_quant_type()
 
     def _resident_local_num_experts(self) -> int:
-        if self.moe_instance_id not in self.offload_executor.offloaded_layer_id_set:
+        if not self.offload_executor.should_offload_layer(self):
             return self.full_local_num_experts
-        if self.offload_config.mode == "layer_wise":
+        if self.offload_executor.offload_full_layer:
             return 0
         return min(int(self.offload_config.num_hot_experts),
                    self.full_local_num_experts)
@@ -626,10 +384,9 @@ class OffloadAscendFusedMoE(FusedMoE):
 
         if isinstance(method, AscendW8A8DynamicFusedMoEMethod):
             return QuantType.W8A8
-        elif isinstance(method, AscendW4A8DynamicFusedMoEMethod):
+        if isinstance(method, AscendW4A8DynamicFusedMoEMethod):
             return QuantType.W4A8
-        else:
-            return QuantType.NONE
+        return QuantType.NONE
 
     def update_expert_map(self, new_expert_map):
         self._expert_map = new_expert_map
@@ -656,37 +413,32 @@ class OffloadAscendFusedMoE(FusedMoE):
                       loaded_weight: torch.Tensor, weight_name: str,
                       shard_id: str, expert_id: int,
                       return_success: bool = False) -> bool | None:
-        is_expert_weight = (
-            weight_name.endswith("w13_weight")
-            or weight_name.endswith("w2_weight")
-        )
-        if is_expert_weight:
-            load_offloaded_weights = self.offload_executor.load_weight(
-                self, weight_name, shard_id, expert_id, loaded_weight
+        param_name = next(
+            (name for name in (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w13_weight_offset",
+                "w2_weight_scale",
+                "w2_weight_offset",
             )
-            if load_offloaded_weights:
-                return True if return_success else None
+             if getattr(self, name, None) is param),
+            None)
+        load_offloaded_weights = self.offload_executor.load_weight(
+            self, param_name or weight_name, shard_id, expert_id,
+            loaded_weight)
+        if load_offloaded_weights:
+            return True if return_success else None
 
         return super().weight_loader(param, loaded_weight, weight_name,
                                      shard_id, expert_id, return_success)
-
-    def forward(self, hidden_states: torch.Tensor,
-                router_logits: torch.Tensor) -> torch.Tensor:
-        return super().forward(hidden_states=hidden_states,
-                               router_logits=router_logits)
 
     def forward_impl(self, hidden_states: torch.Tensor,
                      router_logits: torch.Tensor):
         assert self.quant_method is not None
 
-        # For w8a8 dynamic we can do npu_dynamic_quant and gate in parallel.
-        quantized_x_for_share, dynamic_scale_for_share = None, None
-
         forward_context = get_forward_context()
 
-        # Load balancing for token distribution among experts in dummy_run
-        # TODO: The community only considers load balancing when DP > 1.
-        # This approach may overlook some extreme scenarios.
         enable_force_load_balance = forward_context.in_profile_run
 
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
@@ -701,7 +453,6 @@ class OffloadAscendFusedMoE(FusedMoE):
         else:
             pertoken_scale = None
 
-        # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -719,8 +470,8 @@ class OffloadAscendFusedMoE(FusedMoE):
             e_score_correction_bias=self.e_score_correction_bias,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
-            quantized_x_for_share=quantized_x_for_share,
-            dynamic_scale_for_share=dynamic_scale_for_share,
+            quantized_x_for_share=None,
+            dynamic_scale_for_share=None,
             shared_experts=None,
             enable_force_load_balance=enable_force_load_balance,
             log2phy=self.log2phy,
@@ -730,14 +481,17 @@ class OffloadAscendFusedMoE(FusedMoE):
         if isinstance(final_hidden_states, tuple):
             final_hidden_states, group_list_type, expert_tokens = final_hidden_states
             if self.dynamic_eplb:
-
                 moe_load_stream = moe_load_async_stream()
                 cur_stream = torch.npu.current_stream()
 
                 moe_load_stream.wait_stream(cur_stream)
                 with npu_stream_switch(moe_load_stream):
-                    self.moe_load += expert_tokens if group_list_type == 1 else \
-                        torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
+                    if group_list_type != 1:
+                        expert_tokens = torch.cat([
+                            expert_tokens[:1],
+                            expert_tokens[1:] - expert_tokens[:-1],
+                        ])
+                    self.moe_load += expert_tokens
                 cur_stream.wait_stream(moe_load_stream)
 
         final_hidden_states = forward_context.moe_comm_method.finalize(

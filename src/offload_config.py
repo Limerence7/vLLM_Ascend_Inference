@@ -1,9 +1,8 @@
-import copy
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass, field, replace
 
 
 OFFLOAD_MODES = ("none", "layer_wise", "expert_wise")
+
 
 @dataclass
 class OffloadConfig:
@@ -16,29 +15,31 @@ class OffloadConfig:
 
     def validate(self) -> None:
         self.mode = self.mode.strip().lower()
-        assert self.mode in OFFLOAD_MODES, f"{self.mode} is not supported for offloading."
-        assert self.interval > 0, f"Offload Interval must be positive"
+        assert self.mode in OFFLOAD_MODES, (
+            f"{self.mode} is not supported for offloading.")
+        assert self.interval > 0, "Offload Interval must be positive"
         assert self.num_buffers >= 2, "Offload needs at least two cold expert buffers."
         assert self.num_hot_experts >= 0, "num_hot_experts must be non-negative."
 
-    def normalized_copy(self) -> "OffloadConfig":
-        config = copy.deepcopy(self)
-        config.validate()
-        return config
+    @property
+    def offload_full_layers(self) -> bool:
+        return (self.mode == "layer_wise"
+                or self.mode == "expert_wise" and self.num_hot_experts == 0)
 
-    def prepare_for_model(self, num_layers: int,
-                          num_experts: Optional[int] = None) -> None:
+    def prepare_for_model(self, num_layers: int, num_experts: int) -> None:
         self.validate()
         num_layers = int(num_layers)
 
         if self.mode == "none":
             layer_ids: list[int] = []
         else:
-            layer_ids = self.offloaded_layer_ids or list(
-                range(0, num_layers, self.interval))
-            if num_experts is not None:
-                assert self.num_hot_experts <= int(num_experts), (
-                    "num_hot_experts cannot exceed num_experts.")
+            self.num_hot_experts = min(self.num_hot_experts, num_experts)
+            no_experts_to_offload = (
+                self.mode == "expert_wise"
+                and self.num_hot_experts == num_experts)
+            layer_ids = [] if no_experts_to_offload else (
+                self.offloaded_layer_ids
+                or list(range(0, num_layers, self.interval)))
 
         self.offloaded_layer_ids = [
             layer_id for layer_id in sorted({int(i) for i in layer_ids})
@@ -48,27 +49,14 @@ class OffloadConfig:
 
 OFFLOAD_CONFIG = OffloadConfig()
 
+
 def get_offload_config() -> OffloadConfig:
-    global OFFLOAD_CONFIG
     return OFFLOAD_CONFIG
 
-def set_offload_config(
-        mode: str,
-        interval,
-        num_buffers,
-        num_hot_experts,
-        cpu_pin_memory,
-        offloaded_layer_ids,
-    ) -> OffloadConfig:
+
+def set_offload_config(config: OffloadConfig) -> OffloadConfig:
     global OFFLOAD_CONFIG
-    OFFLOAD_CONFIG = OffloadConfig(
-        mode=mode,
-        interval=interval,
-        num_buffers=num_buffers,
-        num_hot_experts=num_hot_experts,
-        cpu_pin_memory=cpu_pin_memory,
-        offloaded_layer_ids=offloaded_layer_ids,
-    )
+    OFFLOAD_CONFIG = replace(
+        config, offloaded_layer_ids=list(config.offloaded_layer_ids))
     OFFLOAD_CONFIG.validate()
-    
     return OFFLOAD_CONFIG
