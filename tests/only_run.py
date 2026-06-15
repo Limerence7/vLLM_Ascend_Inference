@@ -1,4 +1,5 @@
 import src
+import random
 from src.offload_config import OffloadConfig
 from vllm import LLM, SamplingParams
 
@@ -15,10 +16,10 @@ TEST_CONFIG = {
 }
 
 OFFLOAD_CONFIG = OffloadConfig(
-    mode="expert_wise",
+    mode="manual",
     interval=8,
     num_buffers=2,
-    num_hot_experts=0,
+    num_hot_experts=69,
     cpu_pin_memory=True,
     offloaded_layer_ids=[],
 )
@@ -33,7 +34,7 @@ OFFLOAD_CONFIG = OffloadConfig(
 # }
 
 # OFFLOAD_CONFIG = OffloadConfig(
-#     mode="expert_wise",
+#     mode="manual",
 #     interval=16,
 #     num_buffers=2,
 #     num_hot_experts=8,
@@ -53,7 +54,7 @@ OFFLOAD_CONFIG = OffloadConfig(
 # }
 
 # OFFLOAD_CONFIG = OffloadConfig(
-#     mode="expert_wise",
+#     mode="manual",
 #     interval=16,
 #     num_buffers=2,
 #     num_hot_experts=8,

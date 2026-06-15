@@ -13,6 +13,15 @@ class MoERoutingView:
     row_indices: torch.Tensor
 
 
+def map_expert_ids(expert_ids: torch.Tensor,
+                   expert_map: torch.Tensor) -> tuple[torch.Tensor,
+                                                     torch.Tensor]:
+    """Map valid router expert ids and mark experts absent from this rank."""
+
+    mapped_ids = expert_map[expert_ids.long()]
+    return mapped_ids, mapped_ids >= 0
+
+
 def build_routing_view(hidden_states: torch.Tensor, topk_ids: torch.Tensor,
                        topk_weights: torch.Tensor,
                        row_mask: torch.Tensor) -> MoERoutingView | None:

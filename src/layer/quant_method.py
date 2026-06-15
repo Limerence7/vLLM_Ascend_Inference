@@ -104,7 +104,7 @@ class OffloadFusedMoEMethod:
             add_routing_output(output, cold_routing, cold_output)
         return output
 
-    def _apply_layer_wise_offload(self, layer, moe_comm_method, x,
+    def _apply_full_layer_offload(self, layer, moe_comm_method, x,
                                   topk_weights, topk_ids, cold_experts,
                                   shared_experts,
                                   apply_router_weight_on_input, mc2_mask,
@@ -123,26 +123,6 @@ class OffloadFusedMoEMethod:
             shared_experts=shared_experts,
             apply_router_weight_on_input=apply_router_weight_on_input,
             dynamic_eplb=False,
-            mc2_mask=mc2_mask,
-            pertoken_scale=pertoken_scale,
-        )
-
-    def _apply_resident_experts(self, layer, moe_comm_method, x, topk_weights,
-                                topk_ids, global_num_experts, expert_map,
-                                shared_experts, apply_router_weight_on_input,
-                                mc2_mask, pertoken_scale):
-        return self._fused_experts(
-            layer=layer,
-            moe_comm_method=moe_comm_method,
-            experts=layer,
-            hidden_states=x,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            shared_experts=shared_experts,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            dynamic_eplb=self.dynamic_eplb,
             mc2_mask=mc2_mask,
             pertoken_scale=pertoken_scale,
         )
@@ -193,28 +173,18 @@ class OffloadFusedMoEMethod:
         mc2_mask = kwargs.get("mc2_mask")
         prepared_cold_experts = layer.offload_executor.prepare_cold_experts(
             layer, topk_ids)
-        if prepared_cold_experts is None:
-            return self._apply_resident_experts(
-                layer, moe_comm_method, x, topk_weights, topk_ids,
-                global_num_experts, expert_map, shared_experts,
-                apply_router_weight_on_input, mc2_mask, pertoken_scale)
 
-        cold_experts, cold_topk_ids, cold_mask = prepared_cold_experts
+        cold_experts = prepared_cold_experts.experts
         if layer.offload_executor.offload_full_layer:
-            return self._apply_layer_wise_offload(
+            return self._apply_full_layer_offload(
                 layer, moe_comm_method, x, topk_weights, topk_ids,
                 cold_experts, shared_experts, apply_router_weight_on_input,
                 mc2_mask, pertoken_scale)
 
-        if not cold_mask.any():
-            return self._apply_resident_experts(
-                layer, moe_comm_method, x, topk_weights, topk_ids,
-                global_num_experts, expert_map, shared_experts,
-                apply_router_weight_on_input, mc2_mask, pertoken_scale)
-
         return self._apply_split_offload(
             layer, moe_comm_method, x, topk_weights, topk_ids, cold_experts,
-            cold_topk_ids, cold_mask, shared_experts,
+            prepared_cold_experts.topk_ids, prepared_cold_experts.mask,
+            shared_experts,
             apply_router_weight_on_input, mc2_mask, pertoken_scale)
 
 

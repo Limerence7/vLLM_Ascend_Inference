@@ -1,12 +1,12 @@
 from dataclasses import dataclass, field, replace
 
 
-OFFLOAD_MODES = ("none", "layer_wise", "expert_wise")
+OFFLOAD_MODES = ("none", "manual", "auto")
 
 
 @dataclass
 class OffloadConfig:
-    mode: str = "layer_wise"
+    mode: str = "manual"
     interval: int = 2
     num_buffers: int = 2
     num_hot_experts: int = 0
@@ -18,26 +18,23 @@ class OffloadConfig:
         assert self.mode in OFFLOAD_MODES, (
             f"{self.mode} is not supported for offloading.")
         assert self.interval > 0, "Offload Interval must be positive"
-        assert self.num_buffers >= 2, "Offload needs at least two cold expert buffers."
+        assert self.num_buffers >= 2, (
+            "Offload needs at least two cold expert buffers.")
         assert self.num_hot_experts >= 0, "num_hot_experts must be non-negative."
 
     @property
     def offload_full_layers(self) -> bool:
-        return (self.mode == "layer_wise"
-                or self.mode == "expert_wise" and self.num_hot_experts == 0)
+        return (self.num_hot_experts == 0)
 
     def prepare_for_model(self, num_layers: int, num_experts: int) -> None:
         self.validate()
-        num_layers = int(num_layers)
 
-        if self.mode == "none":
+        if self.mode == "none" or self.num_hot_experts >= num_experts:
             layer_ids: list[int] = []
         else:
             self.num_hot_experts = min(self.num_hot_experts, num_experts)
-            no_experts_to_offload = (
-                self.mode == "expert_wise"
-                and self.num_hot_experts == num_experts)
-            layer_ids = [] if no_experts_to_offload else (
+            no_offload = (self.num_hot_experts == num_experts)
+            layer_ids = [] if no_offload else (
                 self.offloaded_layer_ids
                 or list(range(0, num_layers, self.interval)))
 
@@ -46,13 +43,10 @@ class OffloadConfig:
             if 0 <= layer_id < num_layers
         ]
 
-
 OFFLOAD_CONFIG = OffloadConfig()
-
 
 def get_offload_config() -> OffloadConfig:
     return OFFLOAD_CONFIG
-
 
 def set_offload_config(config: OffloadConfig) -> OffloadConfig:
     global OFFLOAD_CONFIG

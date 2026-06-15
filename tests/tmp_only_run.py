@@ -1,5 +1,6 @@
 import src
 import json
+import random
 from src.offload_config import OffloadConfig
 from vllm import LLM, SamplingParams
 
@@ -14,10 +15,10 @@ TEST_CONFIG = {
 }
 
 OFFLOAD_CONFIG = OffloadConfig(
-    mode="expert_wise",
+    mode="manual",
     interval=16,
     num_buffers=2,
-    num_hot_experts=64,
+    num_hot_experts=56,
     cpu_pin_memory=True,
     offloaded_layer_ids=[],
 )
@@ -37,6 +38,7 @@ def load_contents_from_jsonl(jsonl_path):
                 text += (human + assistant)
             if len(text) >= 1024:
                 contents.append(text)
+    random.shuffle(contents)
     return contents
 
 def build_prompts(batch_size: int, max_length: int) -> list[str]:

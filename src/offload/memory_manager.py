@@ -34,8 +34,7 @@ class CpuExpertWeights:
         if param_name not in self.tensors:
             return False
 
-        slot = self.expert_id_to_slot[int(local_expert_id)]
-        loaded_weight = loaded_weight.detach().cpu()
+        slot = self.expert_id_to_slot[local_expert_id]
         expert_data = self.tensors[param_name][slot]
 
         if param_name.startswith("w2_") and shard_id == "w2":
@@ -61,17 +60,20 @@ class CpuExpertWeights:
 
         return False
 
-    def weights(self) -> dict[str, torch.Tensor]:
-        return self.tensors
-
     def process_after_loading(self, quant_method) -> None:
         quant_method.process_offloaded_weights(self.tensors)
 
-    def _empty_cpu_like(self, tensor: torch.Tensor, num_experts: int,
-                        cpu_pin_memory: bool) -> torch.Tensor:
-        cpu_tensor = torch.empty((num_experts, *tensor.shape[1:]),
-                                 dtype=tensor.dtype,
-                                 device="cpu")
+    @staticmethod
+    def _empty_cpu_like(
+        template_tensor: torch.Tensor,
+        num_experts: int,
+        cpu_pin_memory: bool
+    ) -> torch.Tensor:
+        cpu_tensor = torch.empty(
+            (num_experts, *template_tensor.shape[1:]),
+            dtype=template_tensor.dtype,
+            device="cpu"
+        )
         if cpu_pin_memory:
             cpu_tensor = cpu_tensor.pin_memory()
         return cpu_tensor.contiguous()
@@ -84,16 +86,17 @@ class ExpertMemoryManager:
         self.cpu_pin_memory = cpu_pin_memory
         self.layers: dict[int, CpuExpertWeights] = {}
 
-    def register_layer(self, layer_id: int, layer,
-                       cold_expert_ids: list[int]) -> CpuExpertWeights | None:
-        if not cold_expert_ids:
-            return None
+    def register_layer(
+        self,
+        layer_id: int,
+        layer,
+        cold_expert_ids: list[int]
+    ) -> None:
         self.layers[layer_id] = CpuExpertWeights(
             layer=layer,
             cold_expert_ids=cold_expert_ids,
             cpu_pin_memory=self.cpu_pin_memory,
         )
-        return self.layers[layer_id]
 
     def load_weight_shard(self, layer_id: int, param_name: str,
                           local_expert_id: int, shard_id: str,
@@ -107,7 +110,7 @@ class ExpertMemoryManager:
         self.layers[layer_id].process_after_loading(quant_method)
 
     def get_expert_weights(self, layer_id: int) -> dict[str, torch.Tensor]:
-        return self.layers[layer_id].weights()
+        return self.layers[layer_id].tensors
 
     def summary(self) -> dict[str, object]:
         return {

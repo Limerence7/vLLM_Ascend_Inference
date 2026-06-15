@@ -1,4 +1,4 @@
-from bisect import bisect_right
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -45,19 +45,20 @@ class ColdExperts(nn.Module):
                         source, non_blocking=True)
 
     def wait(self) -> None:
-        if self.load_stream is None:
-            return
-        torch.npu.current_stream().wait_stream(self.load_stream)
+        if self.load_stream is not None:
+            torch.npu.current_stream().wait_stream(self.load_stream)
 
 
-PreparedColdExperts = tuple[ColdExperts, torch.Tensor | None,
-                            torch.Tensor | None]
+class PreparedColdExperts(NamedTuple):
+    experts: ColdExperts
+    topk_ids: torch.Tensor | None
+    mask: torch.Tensor | None
 
 
 class OffloadExecutor(nn.Module):
     """Controls layer-ahead cold expert prefetch with reusable buffers."""
 
-    def __init__(self, config: OffloadConfig):
+    def __init__(self, config: OffloadConfig, uses_w8a8: bool):
         super().__init__()
         self.config = config
         self.offload_full_layer = config.offload_full_layers
@@ -66,42 +67,69 @@ class OffloadExecutor(nn.Module):
             cpu_pin_memory=config.cpu_pin_memory)
 
         self.layers: dict[int, nn.Module] = {}
-        self.layer_ids: list[int] = []
         self.cold_experts = nn.ModuleList()
-        self.next_buffer_id = 0
-        self.pending: dict[int, ColdExperts] = {}
+        self.uses_w8a8 = uses_w8a8
+        self.layer_ids: list[int] = []
+        self.next_layer_by_id: dict[int, int] = {}
+        self.buffer_idx = 0
+        self.buffer_status: list[int | None] = []
         self.layer_cold_expert_ids: dict[int, list[int]] = {}
         self.routing_maps: dict[int, LayerRoutingMap] = {}
         self.prefetch_stream: torch.npu.Stream | None = None
+
+    def init_cold_buffers(self) -> None:
+        if self.cold_experts:
+            return
+
+        self.num_buffers = self.config.num_buffers
+        template_id = self.layer_ids[0]
+        template_weights = self.memory_manager.get_expert_weights(template_id)
+        num_experts = max(
+            len(cold_ids) for cold_ids in self.layer_cold_expert_ids.values()
+        )
+
+        self.buffer_idx = 0
+        self.buffer_status = [None] * self.num_buffers
+        self.next_layer_by_id = {
+            layer_id: self.layer_ids[(index + 1) % len(self.layer_ids)]
+            for index, layer_id in enumerate(self.layer_ids)
+        }
+        for _ in range(self.num_buffers):
+            self.cold_experts.append(
+                ColdExperts(
+                    templates=template_weights,
+                    num_experts=num_experts,
+                    device=self.layers[template_id].w13_weight.device,
+                    use_w8a8=self.uses_w8a8,
+                ))
 
     def register_layer(self, layer) -> None:
         layer_id = int(layer.moe_instance_id)
         self.layers[layer_id] = layer
 
-        cold_expert_ids = self.get_layer_cold_expert_ids(layer)
+        cold_expert_ids = self._cold_expert_ids(
+            layer.full_local_num_experts)
         self.layer_cold_expert_ids[layer_id] = cold_expert_ids
-        if cold_expert_ids:
-            self.layer_ids.append(layer_id)
-            self.layer_ids.sort()
-            self.routing_maps[layer_id] = LayerRoutingMap(
-                layer, cold_expert_ids)
+        self.layer_ids.append(layer_id)
+        self.layer_ids.sort()
+        self.routing_maps[layer_id] = LayerRoutingMap(
+            layer, cold_expert_ids)
+
         self.memory_manager.register_layer(layer_id, layer, cold_expert_ids)
 
-    def get_layer_cold_expert_ids(self, layer) -> list[int]:
-        if not self.should_offload_layer(layer):
-            return []
-        local_num_experts = int(layer.full_local_num_experts)
-        first_cold_expert = (
-            0 if self.offload_full_layer else self.config.num_hot_experts)
+    def _cold_expert_ids(self, local_num_experts: int) -> list[int]:
+        first_cold_expert = self.config.num_hot_experts
         return list(range(first_cold_expert, local_num_experts))
+
+    def should_offload_expert(self, layer, local_expert_id: int) -> bool:
+        return (
+            self.should_offload_layer(layer) and local_expert_id >= 0 and
+            (self.offload_full_layer
+             or local_expert_id >= self.config.num_hot_experts)
+        )
 
     def should_offload_layer(self, layer) -> bool:
         return layer.moe_instance_id in self.offloaded_layer_ids
-
-    def should_offload_expert(self, layer, local_expert_id: int) -> bool:
-        return (self.should_offload_layer(layer) and local_expert_id >= 0
-                and (self.offload_full_layer
-                     or local_expert_id >= self.config.num_hot_experts))
 
     def load_weight(self, layer, param_name: str, shard_id: str,
                     global_expert_id: int,
@@ -121,87 +149,47 @@ class OffloadExecutor(nn.Module):
         )
 
     def process_layer_after_loading(self, layer, quant_method) -> None:
-        if layer.moe_instance_id not in self.memory_manager.layers:
-            return
         self.memory_manager.process_layer_after_loading(layer.moe_instance_id,
                                                         quant_method)
 
     def prepare_cold_experts(self, layer,
-                             topk_ids: torch.Tensor
-                             ) -> PreparedColdExperts | None:
-        cold_experts = self.pending.pop(layer.moe_instance_id, None)
-        if cold_experts is None:
-            cold_experts = self.start_prefetch(layer)
-        if cold_experts is None:
-            return None
+                             topk_ids: torch.Tensor) -> PreparedColdExperts:
+        current_layer = layer.moe_instance_id
+        if not self.cold_experts:
+            self.init_cold_buffers()
+        if current_layer == self.buffer_status[self.buffer_idx]:
+            cold_expert = self.cold_experts[self.buffer_idx]
+        else:
+            cold_expert = self.start_prefetch(layer, self.buffer_idx)
+        self.buffer_idx = (self.buffer_idx + 1) % self.num_buffers
 
         if self.offload_full_layer:
-            return cold_experts, None, None
+            return PreparedColdExperts(cold_expert, None, None)
 
         cold_topk_ids, cold_mask = self.build_cold_routing(layer, topk_ids)
-        return cold_experts, cold_topk_ids, cold_mask
+        return PreparedColdExperts(cold_expert, cold_topk_ids, cold_mask)
 
-    def prefetch_next_layers(self, layer) -> torch.npu.Stream | None:
-        next_layer_id = self.next_layer_id(layer.moe_instance_id)
-        if next_layer_id is None:
-            return None
-        next_layer = self.layers.get(next_layer_id)
-        if next_layer is None or next_layer_id in self.pending:
-            return None
+    def prefetch_next_layers(self, layer) -> None:
+        next_layer_id = self.next_layer_by_id[layer.moe_instance_id]
+        if next_layer_id == self.buffer_status[self.buffer_idx]:
+            return
 
-        cold_experts = self.start_prefetch(next_layer)
-        if cold_experts is None:
-            return None
-        self.pending[next_layer_id] = cold_experts
-        return cold_experts.load_stream
+        self.start_prefetch(self.layers[next_layer_id], self.buffer_idx)
 
-    def next_layer_id(self, layer_id: int) -> int | None:
-        if not self.layer_ids:
-            return None
-        next_index = bisect_right(self.layer_ids, layer_id)
-        if next_index >= len(self.layer_ids):
-            next_index = 0
-        return self.layer_ids[next_index]
+    def start_prefetch(self, layer, buffer_id: int) -> ColdExperts:
+        current_layer = layer.moe_instance_id
+        weights = self.memory_manager.get_expert_weights(current_layer)
 
-    def start_prefetch(self, layer) -> ColdExperts | None:
-        cold_expert_ids = self.layer_cold_expert_ids.get(
-            layer.moe_instance_id, [])
-        if not cold_expert_ids:
-            return None
-
-        weights = self.memory_manager.get_expert_weights(
-            layer.moe_instance_id)
-
-        self.maybe_create_cold_buffers(layer, weights)
-
-        cold_experts = self.cold_experts[self.next_buffer_id]
-        self.next_buffer_id = (
-            self.next_buffer_id + 1) % len(self.cold_experts)
+        cold_expert = self.cold_experts[buffer_id]
 
         if self.prefetch_stream is None:
             self.prefetch_stream = torch.npu.Stream()
-
         stream = self.prefetch_stream
         with torch.npu.stream(stream):
-            cold_experts.load_from_cpu(weights)
-        cold_experts.load_stream = stream
-        return cold_experts
-
-    def maybe_create_cold_buffers(self,
-                                  layer,
-                                  weights: dict[str, torch.Tensor]) -> None:
-        if self.cold_experts:
-            return
-        num_experts = max(
-            len(cold_ids) for cold_ids in self.layer_cold_expert_ids.values())
-        for _ in range(self.config.num_buffers):
-            self.cold_experts.append(
-                ColdExperts(
-                    templates=weights,
-                    num_experts=num_experts,
-                    device=layer.w13_weight.device,
-                    use_w8a8=layer.uses_w8a8,
-                ))
+            cold_expert.load_from_cpu(weights)
+        cold_expert.load_stream = stream
+        self.buffer_status[buffer_id] = current_layer
+        return cold_expert
 
     def build_cold_routing(self, layer, topk_ids: torch.Tensor) -> tuple[
             torch.Tensor, torch.Tensor]:
@@ -212,5 +200,5 @@ class OffloadExecutor(nn.Module):
         summary["mode"] = self.config.mode
         summary["num_layers"] = len(self.layers)
         summary["num_cold_expert_buffers"] = len(self.cold_experts)
-        summary["pending_prefetch_layers"] = sorted(self.pending)
+        summary["buffer_status"] = self.buffer_status.copy()
         return summary

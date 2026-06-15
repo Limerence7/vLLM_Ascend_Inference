@@ -33,6 +33,17 @@ from ..offload_config import get_offload_config
 from .quant_method import (OffloadUnquantizedFusedMoEMethod,
                            OffloadW8A8DynamicFusedMoEMethod,
                            wrap_quant_method)
+from .routing import map_expert_ids
+
+
+EXPERT_WEIGHT_NAMES = (
+    "w13_weight",
+    "w2_weight",
+    "w13_weight_scale",
+    "w13_weight_offset",
+    "w2_weight_scale",
+    "w2_weight_offset",
+)
 
 
 class OffloadAscendFusedMoE(FusedMoE):
@@ -189,14 +200,6 @@ class OffloadAscendFusedMoE(FusedMoE):
         self.batched_hidden_states = None
         self.batched_router_logits = None
 
-        self.offload_config = get_offload_config()
-        if OffloadAscendFusedMoE.executor is None:
-            from ..offload.executor import OffloadExecutor
-
-            OffloadAscendFusedMoE.executor = OffloadExecutor(
-                self.offload_config)
-        self.offload_executor = OffloadAscendFusedMoE.executor
-
         OffloadAscendFusedMoE.moe_counter += 1
         self.moe_instance_id = OffloadAscendFusedMoE.moe_counter
 
@@ -207,16 +210,21 @@ class OffloadAscendFusedMoE(FusedMoE):
         self._resident_maps_by_device: dict[torch.device, torch.Tensor] = {}
         self.log2phy = None
 
-        if self.quant_config is None:
-            self.quant_method = OffloadUnquantizedFusedMoEMethod(
-                self.moe_config)
-        else:
-            self.quant_method = wrap_quant_method(
-                self.quant_config.get_quant_method(self, self.layer_name))
+        self.quant_method = (
+            OffloadUnquantizedFusedMoEMethod(self.moe_config)
+            if self.quant_config is None else wrap_quant_method(
+                self.quant_config.get_quant_method(self, self.layer_name)))
 
         assert self.quant_method is not None
         self.uses_w8a8 = isinstance(self.quant_method,
                                     OffloadW8A8DynamicFusedMoEMethod)
+        self.offload_config = get_offload_config()
+        if OffloadAscendFusedMoE.executor is None:
+            from ..offload.executor import OffloadExecutor
+
+            OffloadAscendFusedMoE.executor = OffloadExecutor(
+                self.offload_config, self.uses_w8a8)
+        self.offload_executor = OffloadAscendFusedMoE.executor
 
         self.moe_config.tp_group = get_tp_group()
         self.moe_config.dp_group = get_dp_group()
@@ -271,8 +279,7 @@ class OffloadAscendFusedMoE(FusedMoE):
         self._expert_map = self._build_resident_expert_map()
         self.local_num_experts = self.resident_local_num_experts
 
-        if self.full_expert_map is not None and isinstance(self.full_expert_map,
-                                                       torch.Tensor):
+        if self.full_expert_map is not None:
             logger.info_once(
                 "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
                 " number of experts: %s/%s. Experts local to global index map:"
@@ -344,8 +351,8 @@ class OffloadAscendFusedMoE(FusedMoE):
     def map_global_expert_id_to_full_local_expert_id(
             self, expert_id: int) -> int:
         if self.full_expert_map is None:
-            return int(expert_id)
-        return int(self.full_expert_map[int(expert_id)].item())
+            return expert_id
+        return self.full_expert_map[expert_id].item()
 
     def build_hot_local_routing(self, topk_ids: torch.Tensor,
                                 cold_mask: torch.Tensor) -> tuple[
@@ -365,22 +372,15 @@ class OffloadAscendFusedMoE(FusedMoE):
                                        non_blocking=True)
             self._resident_maps_by_device[topk_ids.device] = expert_map
 
-        global_ids = topk_ids.long()
-        valid = (global_ids >= 0) & (global_ids < expert_map.numel())
-        safe_ids = global_ids.clamp(min=0, max=expert_map.numel() - 1)
-        local_ids = expert_map[safe_ids]
-        hot_mask = valid & (local_ids >= 0) & ~cold_mask
-        fallback = torch.zeros_like(local_ids)
-        hot_ids = torch.where(hot_mask, local_ids, fallback)
+        local_ids, is_local = map_expert_ids(topk_ids, expert_map)
+        hot_mask = is_local & ~cold_mask
+        hot_ids = local_ids.masked_fill(~hot_mask, 0)
         return hot_ids.to(topk_ids.dtype), hot_mask
 
     def _get_quant_type(self) -> QuantType:
-        quant_method = self.quant_method
-        if not hasattr(quant_method,
-                       "quant_method") or quant_method.quant_method is None:
+        method = getattr(self.quant_method, "quant_method", None)
+        if method is None:
             return QuantType.NONE
-
-        method = quant_method.quant_method
 
         if isinstance(method, AscendW8A8DynamicFusedMoEMethod):
             return QuantType.W8A8
@@ -398,6 +398,21 @@ class OffloadAscendFusedMoE(FusedMoE):
         if self.moe_load is not None:
             self.moe_load.zero_()
 
+    def _record_moe_load(self, group_list_type: int,
+                         expert_tokens: torch.Tensor) -> None:
+        moe_load_stream = moe_load_async_stream()
+        current_stream = torch.npu.current_stream()
+
+        moe_load_stream.wait_stream(current_stream)
+        with npu_stream_switch(moe_load_stream):
+            if group_list_type != 1:
+                expert_tokens = torch.cat([
+                    expert_tokens[:1],
+                    expert_tokens[1:] - expert_tokens[:-1],
+                ])
+            self.moe_load += expert_tokens
+        current_stream.wait_stream(moe_load_stream)
+
     def maybe_all_reduce_tensor_model_parallel(
             self, final_hidden_states: torch.Tensor):
         """NOTE(Yizhou): This is to override the parent class method. In `mc2commimpl`,
@@ -413,17 +428,8 @@ class OffloadAscendFusedMoE(FusedMoE):
                       loaded_weight: torch.Tensor, weight_name: str,
                       shard_id: str, expert_id: int,
                       return_success: bool = False) -> bool | None:
-        param_name = next(
-            (name for name in (
-                "w13_weight",
-                "w2_weight",
-                "w13_weight_scale",
-                "w13_weight_offset",
-                "w2_weight_scale",
-                "w2_weight_offset",
-            )
-             if getattr(self, name, None) is param),
-            None)
+        param_name = next((name for name in EXPERT_WEIGHT_NAMES
+                           if getattr(self, name, None) is param), None)
         load_offloaded_weights = self.offload_executor.load_weight(
             self, param_name or weight_name, shard_id, expert_id,
             loaded_weight)
@@ -435,10 +441,7 @@ class OffloadAscendFusedMoE(FusedMoE):
 
     def forward_impl(self, hidden_states: torch.Tensor,
                      router_logits: torch.Tensor):
-        assert self.quant_method is not None
-
         forward_context = get_forward_context()
-
         enable_force_load_balance = forward_context.in_profile_run
 
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
@@ -481,18 +484,7 @@ class OffloadAscendFusedMoE(FusedMoE):
         if isinstance(final_hidden_states, tuple):
             final_hidden_states, group_list_type, expert_tokens = final_hidden_states
             if self.dynamic_eplb:
-                moe_load_stream = moe_load_async_stream()
-                cur_stream = torch.npu.current_stream()
-
-                moe_load_stream.wait_stream(cur_stream)
-                with npu_stream_switch(moe_load_stream):
-                    if group_list_type != 1:
-                        expert_tokens = torch.cat([
-                            expert_tokens[:1],
-                            expert_tokens[1:] - expert_tokens[:-1],
-                        ])
-                    self.moe_load += expert_tokens
-                cur_stream.wait_stream(moe_load_stream)
+                self._record_moe_load(group_list_type, expert_tokens)
 
         final_hidden_states = forward_context.moe_comm_method.finalize(
             hidden_states=final_hidden_states,
