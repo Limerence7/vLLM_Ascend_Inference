@@ -276,6 +276,8 @@ class OffloadAscendFusedMoE(FusedMoE):
             torch.sum(self.full_expert_map != -1).item()
             if self.full_expert_map is not None else self.global_num_experts)
         self.resident_local_num_experts = self._resident_local_num_experts()
+        self.expert_placement = self.offload_executor.init_layer_placement(
+            self)
         self._expert_map = self._build_resident_expert_map()
         self.local_num_experts = self.resident_local_num_experts
 
@@ -331,21 +333,25 @@ class OffloadAscendFusedMoE(FusedMoE):
                    self.full_local_num_experts)
 
     def _build_resident_expert_map(self) -> torch.Tensor | None:
-        if self.resident_local_num_experts == self.full_local_num_experts:
+        resident_ids = self.expert_placement.resident_expert_ids
+        if (self.resident_local_num_experts == self.full_local_num_experts
+                and resident_ids == list(range(self.full_local_num_experts))):
             return self.full_expert_map
 
+        expert_map = torch.full((self.global_num_experts, ),
+                                -1,
+                                dtype=torch.int32)
+        resident_slots = self.expert_placement.resident_slots
         if self.full_expert_map is None:
-            expert_map = torch.full((self.global_num_experts, ),
-                                    -1,
-                                    dtype=torch.int32)
-            if self.resident_local_num_experts > 0:
-                expert_map[:self.resident_local_num_experts] = torch.arange(
-                    self.resident_local_num_experts, dtype=torch.int32)
+            for local_id, slot in resident_slots.items():
+                expert_map[local_id] = slot
             return expert_map
 
-        expert_map = self.full_expert_map.detach().clone()
-        cold_mask = expert_map >= self.resident_local_num_experts
-        expert_map[cold_mask] = -1
+        full_map = self.full_expert_map.detach().cpu()
+        for global_id, local_id in enumerate(full_map.tolist()):
+            slot = resident_slots.get(int(local_id))
+            if slot is not None:
+                expert_map[global_id] = slot
         return expert_map
 
     def map_global_expert_id_to_full_local_expert_id(

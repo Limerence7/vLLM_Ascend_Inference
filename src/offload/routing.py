@@ -1,16 +1,17 @@
 import torch
 
 from ..layer.routing import map_expert_ids
+from ..loadbalance import ExpertPlacement
 
 
 class LayerRoutingMap:
     """Map router-selected global expert ids to resident cold-buffer ids."""
 
-    def __init__(self, layer, cold_expert_ids: list[int]):
+    def __init__(self, layer, placement: ExpertPlacement):
         self.local_num_experts = int(layer.full_local_num_experts)
         self.global_to_local = self._build_global_to_local(layer)
         self.local_to_cold_expert = self._build_local_to_cold_expert(
-            cold_expert_ids)
+            placement)
         self._device_maps: dict[torch.device,
                                 tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -50,12 +51,11 @@ class LayerRoutingMap:
         return layer.full_expert_map.detach().to(device="cpu",
                                                  dtype=torch.long)
 
-    def _build_local_to_cold_expert(self,
-                                    cold_expert_ids: list[int]) -> torch.Tensor:
+    def _build_local_to_cold_expert(
+            self, placement: ExpertPlacement) -> torch.Tensor:
         local_to_cold = torch.full((self.local_num_experts, ),
                                    -1,
                                    dtype=torch.long)
-        expert_ids = torch.tensor(cold_expert_ids, dtype=torch.long)
-        local_to_cold[expert_ids] = torch.arange(len(cold_expert_ids),
-                                                 dtype=torch.long)
+        for expert_id, slot in placement.cold_slots.items():
+            local_to_cold[expert_id] = slot
         return local_to_cold

@@ -1,9 +1,17 @@
 import src
 import json
 import random
+from pathlib import Path
+
 from src.offload_config import OffloadConfig
 from vllm import LLM, SamplingParams
 
+
+LOAD_STATS_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "load_records"
+    / "only_run_load_stats"
+)
 
 TEST_CONFIG = {
     "model_path": "/workspace/models/Qwen3-30B-A3B",
@@ -21,6 +29,8 @@ OFFLOAD_CONFIG = OffloadConfig(
     num_hot_experts=56,
     cpu_pin_memory=True,
     offloaded_layer_ids=[],
+    load_stats_path=str(LOAD_STATS_PATH),
+    load_balance_mode="history",
 )
 
 def load_contents_from_jsonl(jsonl_path):
@@ -41,13 +51,28 @@ def load_contents_from_jsonl(jsonl_path):
     random.shuffle(contents)
     return contents
 
+
 def build_prompts(batch_size: int, max_length: int) -> list[str]:
     jsonl_path = '/workspace/Huawei/datasets/computer_en_26k.jsonl'
     combined_list = load_contents_from_jsonl(jsonl_path)
-    batch_user_inputs = combined_list[:TEST_CONFIG["batch_size"]]
-    batch_user_inputs = [text[:TEST_CONFIG["max_length"]] for text in batch_user_inputs]
-    
+    batch_user_inputs = combined_list[:batch_size]
+    batch_user_inputs = [text[:max_length] for text in batch_user_inputs]
     return batch_user_inputs
+
+
+def save_load_stats(llm: LLM) -> None:
+    save_results = llm.collective_rpc(
+        "save_load_stats",
+        timeout=120,
+    )
+    if not all(result.get("saved") for result in save_results):
+        raise RuntimeError(f"Failed to save load stats: {save_results}")
+    print(f"Load stats worker results: {save_results}")
+    print(f"Load stats saved under: {LOAD_STATS_PATH}")
+
+
+def shutdown_llm(llm: LLM) -> None:
+    llm.llm_engine.engine_core.shutdown()
 
 
 if __name__ == "__main__":
@@ -69,13 +94,17 @@ if __name__ == "__main__":
         gpu_memory_utilization=TEST_CONFIG["utilization"],
         max_model_len=TEST_CONFIG["max_length"] + TEST_CONFIG["max_new_tokens"],
         dtype="bfloat16",
+        # quantization='ascend',
         enforce_eager=True,
+        worker_extension_cls="src.utils.OffloadWorkerExtension",
     )
 
     outputs = llm.generate(
         build_prompts(TEST_CONFIG["batch_size"], TEST_CONFIG["max_length"]),
         sampling_params,
     )
+    save_load_stats(llm)
+    shutdown_llm(llm)
 
     for output in outputs:
         print(f"Prompt:\n{output.prompt}\n")

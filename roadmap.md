@@ -7,10 +7,10 @@
 支持以下运行模式：
 
 * `none`：使用原生 vLLM-Ascend MoE，不进行卸载。
-* `layer_wise`：将指定 MoE 层的全部本地专家卸载到 CPU。
-* `expert_wise`：保留指定数量的本地热专家，将其余专家卸载到 CPU。
+* `manual`：根据配置的层编号或间隔执行专家卸载。
+* `auto`：自动卸载模式的扩展入口，当前层选择逻辑与 `manual` 相同。
 
-`expert_wise` 的特殊语义：
+卸载路径由 `num_hot_experts` 决定：
 
 * `num_hot_experts=0`：使用整层卸载路径。
 * `num_hot_experts` 达到单卡专家数：不进行专家卸载。

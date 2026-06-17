@@ -2,6 +2,7 @@ from dataclasses import dataclass, field, replace
 
 
 OFFLOAD_MODES = ("none", "manual", "auto")
+LOAD_BALANCE_MODES = ("none", "history", "dynamic")
 
 
 @dataclass
@@ -12,15 +13,26 @@ class OffloadConfig:
     num_hot_experts: int = 0
     cpu_pin_memory: bool = True
     offloaded_layer_ids: list[int] = field(default_factory=list)
+    load_stats_path: str | None = None
+    load_balance_mode: str = "none"
+    dynamic_update_interval: int = 32
+    dynamic_max_swaps: int = 2
 
     def validate(self) -> None:
         self.mode = self.mode.strip().lower()
+        self.load_balance_mode = self.load_balance_mode.strip().lower()
         assert self.mode in OFFLOAD_MODES, (
             f"{self.mode} is not supported for offloading.")
+        assert self.load_balance_mode in LOAD_BALANCE_MODES, (
+            f"{self.load_balance_mode} is not supported for load balance.")
         assert self.interval > 0, "Offload Interval must be positive"
         assert self.num_buffers >= 2, (
             "Offload needs at least two cold expert buffers.")
         assert self.num_hot_experts >= 0, "num_hot_experts must be non-negative."
+        assert self.dynamic_update_interval > 0, (
+            "dynamic_update_interval must be positive.")
+        assert self.dynamic_max_swaps >= 0, (
+            "dynamic_max_swaps must be non-negative.")
 
     @property
     def offload_full_layers(self) -> bool:

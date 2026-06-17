@@ -169,6 +169,8 @@ class OffloadFusedMoEMethod:
             topk_ids = torch.argsort(
                 random_matrix, dim=1)[:, :topk_ids.size(1)].to(topk_ids.dtype)
 
+        layer.offload_executor.record_load(layer, topk_ids)
+
         moe_comm_method = get_forward_context().moe_comm_method
         mc2_mask = kwargs.get("mc2_mask")
         prepared_cold_experts = layer.offload_executor.prepare_cold_experts(

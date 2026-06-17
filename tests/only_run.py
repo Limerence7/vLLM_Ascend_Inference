@@ -1,8 +1,15 @@
 import src
-import random
+from pathlib import Path
+
 from src.offload_config import OffloadConfig
 from vllm import LLM, SamplingParams
 
+
+LOAD_STATS_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "load_records"
+    / "only_run_load_stats"
+)
 
 TEST_CONFIG = {
     "model_path": "/workspace/models/Qwen3-30B-A3B",
@@ -17,11 +24,12 @@ TEST_CONFIG = {
 
 OFFLOAD_CONFIG = OffloadConfig(
     mode="manual",
-    interval=8,
+    interval=16,
     num_buffers=2,
-    num_hot_experts=69,
+    num_hot_experts=56,
     cpu_pin_memory=True,
     offloaded_layer_ids=[],
+    load_stats_path=str(LOAD_STATS_PATH),
 )
 
 # TEST_CONFIG = {
@@ -69,6 +77,21 @@ def build_prompts(batch_size: int, max_length: int) -> list[str]:
     return [prompt for _ in range(batch_size)]
 
 
+def save_load_stats(llm: LLM) -> None:
+    save_results = llm.collective_rpc(
+        "save_load_stats",
+        timeout=120,
+    )
+    if not all(result.get("saved") for result in save_results):
+        raise RuntimeError(f"Failed to save load stats: {save_results}")
+    print(f"Load stats worker results: {save_results}")
+    print(f"Load stats saved under: {LOAD_STATS_PATH}")
+
+
+def shutdown_llm(llm: LLM) -> None:
+    llm.llm_engine.engine_core.shutdown()
+
+
 if __name__ == "__main__":
     src.register_plugin(OFFLOAD_CONFIG)
 
@@ -90,12 +113,15 @@ if __name__ == "__main__":
         dtype="bfloat16",
         # quantization='ascend',
         enforce_eager=True,
+        worker_extension_cls="src.utils.OffloadWorkerExtension",
     )
 
     outputs = llm.generate(
         build_prompts(TEST_CONFIG["batch_size"], TEST_CONFIG["max_length"]),
         sampling_params,
     )
+    save_load_stats(llm)
+    shutdown_llm(llm)
 
     for output in outputs:
         print(f"Prompt:\n{output.prompt}\n")
