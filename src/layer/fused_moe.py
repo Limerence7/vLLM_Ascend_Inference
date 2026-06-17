@@ -397,6 +397,11 @@ class OffloadAscendFusedMoE(FusedMoE):
     def update_expert_map(self, new_expert_map):
         self._expert_map = new_expert_map
 
+    def apply_expert_placement(self, placement) -> None:
+        self.expert_placement = placement
+        self._expert_map = self._build_resident_expert_map()
+        self._resident_maps_by_device.clear()
+
     def get_log2phy_map(self):
         return self.log2phy
 

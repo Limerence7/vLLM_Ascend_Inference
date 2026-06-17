@@ -15,7 +15,7 @@ TEST_CONFIG = {
     "model_path": "/workspace/models/Qwen3-30B-A3B",
     "batch_size": 1,
     "max_length": 32,
-    "max_new_tokens": 4,
+    "max_new_tokens": 8,
     "max_num_batched_tokens": 64,
     "max_num_seqs": 1,
     "world_size": 2,
@@ -30,6 +30,9 @@ OFFLOAD_CONFIG = OffloadConfig(
     cpu_pin_memory=True,
     offloaded_layer_ids=[],
     load_stats_path=str(LOAD_STATS_PATH),
+    load_balance_mode="dynamic",
+    dynamic_update_interval=2,
+    dynamic_max_swaps=2,
 )
 
 # TEST_CONFIG = {
@@ -78,6 +81,10 @@ def build_prompts(batch_size: int, max_length: int) -> list[str]:
 
 
 def save_load_stats(llm: LLM) -> None:
+    if OFFLOAD_CONFIG.load_balance_mode != "none":
+        print("Skip load stats save outside load_balance_mode='none'.")
+        return
+
     save_results = llm.collective_rpc(
         "save_load_stats",
         timeout=120,

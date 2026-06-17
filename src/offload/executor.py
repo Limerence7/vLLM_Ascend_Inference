@@ -7,7 +7,9 @@ import torch_npu
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 from ..offload_config import OffloadConfig
-from ..loadbalance import ExpertLoadStats, ExpertPlacement, HistoryLoadPolicy
+from ..loadbalance import (DynamicExpertScheduler, DynamicLoadPolicy,
+                           ExpertLoadStats, ExpertPlacement,
+                           HistoryLoadPolicy)
 from .memory_manager import ExpertMemoryManager
 from .routing import LayerRoutingMap
 
@@ -63,6 +65,7 @@ class OffloadExecutor(nn.Module):
         super().__init__()
         self.config = config
         self.offload_full_layer = config.offload_full_layers
+        self.dynamic_load_balance = config.load_balance_mode == "dynamic"
         self.offloaded_layer_ids = set(config.offloaded_layer_ids)
         self.memory_manager = ExpertMemoryManager(
             cpu_pin_memory=config.cpu_pin_memory)
@@ -82,6 +85,15 @@ class OffloadExecutor(nn.Module):
             self.load_stats
             if config.load_balance_mode in ("history", "dynamic") else None)
         self.history_policy = HistoryLoadPolicy(history_stats)
+        self.dynamic_scheduler = self._init_dynamic_scheduler(config)
+
+    def _init_dynamic_scheduler(
+            self, config: OffloadConfig) -> DynamicExpertScheduler | None:
+        if not self.dynamic_load_balance:
+            return None
+
+        policy = DynamicLoadPolicy(self.load_stats, config.dynamic_max_swaps)
+        return DynamicExpertScheduler(policy, config.dynamic_update_interval)
 
     def _init_load_stats(self,
                          config: OffloadConfig) -> ExpertLoadStats | None:
@@ -102,7 +114,10 @@ class OffloadExecutor(nn.Module):
 
         self.num_buffers = self.config.num_buffers
         template_id = self.layer_ids[0]
-        template_weights = self.memory_manager.get_expert_weights(template_id)
+        template_weights = self.memory_manager.get_expert_weights(
+            template_id,
+            self.placements[template_id].cold_expert_ids,
+        )
         num_experts = max(
             len(placement.cold_expert_ids)
             for placement in self.placements.values()
@@ -136,8 +151,11 @@ class OffloadExecutor(nn.Module):
         if self.load_stats is not None:
             self.load_stats.register_layer(layer)
 
-        self.memory_manager.register_layer(layer_id, layer,
-                                           placement.cold_expert_ids)
+        self.memory_manager.register_layer(
+            layer_id,
+            layer,
+            self._stored_expert_ids(layer, placement),
+        )
 
     def init_layer_placement(self, layer) -> ExpertPlacement:
         layer_id = int(layer.moe_instance_id)
@@ -159,6 +177,15 @@ class OffloadExecutor(nn.Module):
              or self.is_cold_expert(layer, local_expert_id))
         )
 
+    def should_store_cpu_expert(self, layer, local_expert_id: int) -> bool:
+        if not self.should_offload_layer(layer) or local_expert_id < 0:
+            return False
+        return (
+            self.dynamic_load_balance
+            or self.offload_full_layer
+            or self.is_cold_expert(layer, local_expert_id)
+        )
+
     def should_offload_layer(self, layer) -> bool:
         return layer.moe_instance_id in self.offloaded_layer_ids
 
@@ -167,10 +194,10 @@ class OffloadExecutor(nn.Module):
                     loaded_weight: torch.Tensor) -> bool:
         local_expert_id = layer.map_global_expert_id_to_full_local_expert_id(
             global_expert_id)
-        if not self.should_offload_expert(layer, local_expert_id):
+        if not self.should_store_cpu_expert(layer, local_expert_id):
             return False
 
-        return self.memory_manager.load_weight_shard(
+        loaded = self.memory_manager.load_weight_shard(
             layer_id=layer.moe_instance_id,
             param_name=param_name,
             local_expert_id=local_expert_id,
@@ -178,6 +205,7 @@ class OffloadExecutor(nn.Module):
             loaded_weight=loaded_weight,
             tp_rank=layer.tp_rank,
         )
+        return loaded and self.should_offload_expert(layer, local_expert_id)
 
     def process_layer_after_loading(self, layer, quant_method) -> None:
         self.memory_manager.process_layer_after_loading(layer.moe_instance_id,
@@ -188,6 +216,8 @@ class OffloadExecutor(nn.Module):
         current_layer = layer.moe_instance_id
         if not self.cold_experts:
             self.init_cold_buffers()
+        if self._can_update_dynamic_placement():
+            self.dynamic_scheduler.maybe_update(self, layer)
         if current_layer == self.buffer_status[self.buffer_idx]:
             cold_expert = self.cold_experts[self.buffer_idx]
         else:
@@ -209,7 +239,7 @@ class OffloadExecutor(nn.Module):
 
     def start_prefetch(self, layer, buffer_id: int) -> ColdExperts:
         current_layer = layer.moe_instance_id
-        weights = self.memory_manager.get_expert_weights(current_layer)
+        cold_expert_ids = self.placements[current_layer].cold_expert_ids
 
         cold_expert = self.cold_experts[buffer_id]
 
@@ -217,7 +247,14 @@ class OffloadExecutor(nn.Module):
             self.prefetch_stream = torch.npu.Stream()
         stream = self.prefetch_stream
         with torch.npu.stream(stream):
-            cold_expert.load_from_cpu(weights)
+            if self.dynamic_load_balance:
+                with torch.no_grad():
+                    self.memory_manager.copy_experts_to_module(
+                        current_layer, cold_expert_ids, cold_expert)
+            else:
+                weights = self.memory_manager.get_expert_weights(
+                    current_layer, cold_expert_ids)
+                cold_expert.load_from_cpu(weights)
         cold_expert.load_stream = stream
         self.buffer_status[buffer_id] = current_layer
         return cold_expert
@@ -225,6 +262,39 @@ class OffloadExecutor(nn.Module):
     def build_cold_routing(self, layer, topk_ids: torch.Tensor) -> tuple[
             torch.Tensor, torch.Tensor]:
         return self.routing_maps[layer.moe_instance_id].cold_routing(topk_ids)
+
+    def commit_layer_placement(self, layer,
+                               placement: ExpertPlacement) -> None:
+        layer_id = int(layer.moe_instance_id)
+        self.placements[layer_id] = placement
+        self.routing_maps[layer_id] = LayerRoutingMap(layer, placement)
+        layer.apply_expert_placement(placement)
+        self._invalidate_layer_buffers(layer_id)
+
+    def copy_expert_to_resident(self, layer, local_expert_id: int,
+                                resident_slot: int) -> None:
+        layer_id = int(layer.moe_instance_id)
+        with torch.no_grad():
+            self.memory_manager.copy_experts_to_module(
+                layer_id, [local_expert_id], layer, [resident_slot])
+
+    def _invalidate_layer_buffers(self, layer_id: int) -> None:
+        self.buffer_status = [
+            None if status == layer_id else status
+            for status in self.buffer_status
+        ]
+
+    def _can_update_dynamic_placement(self) -> bool:
+        return (
+            self.dynamic_scheduler is not None
+            and not self.offload_full_layer
+        )
+
+    def _stored_expert_ids(self, layer,
+                           placement: ExpertPlacement) -> list[int]:
+        if self.dynamic_load_balance:
+            return list(range(int(layer.full_local_num_experts)))
+        return placement.cold_expert_ids
 
     def record_load(self, layer, topk_ids: torch.Tensor) -> None:
         if self.load_stats is not None:

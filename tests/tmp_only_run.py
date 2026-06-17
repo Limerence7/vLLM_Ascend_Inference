@@ -26,11 +26,13 @@ OFFLOAD_CONFIG = OffloadConfig(
     mode="manual",
     interval=16,
     num_buffers=2,
-    num_hot_experts=56,
+    num_hot_experts=60,
     cpu_pin_memory=True,
     offloaded_layer_ids=[],
     load_stats_path=str(LOAD_STATS_PATH),
-    load_balance_mode="history",
+    load_balance_mode="dynamic",
+    dynamic_update_interval=32,
+    dynamic_max_swaps=1,
 )
 
 def load_contents_from_jsonl(jsonl_path):
@@ -61,6 +63,10 @@ def build_prompts(batch_size: int, max_length: int) -> list[str]:
 
 
 def save_load_stats(llm: LLM) -> None:
+    if OFFLOAD_CONFIG.load_balance_mode != "none":
+        print("Skip load stats save outside load_balance_mode='none'.")
+        return
+
     save_results = llm.collective_rpc(
         "save_load_stats",
         timeout=120,
