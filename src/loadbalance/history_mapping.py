@@ -16,6 +16,8 @@ class HistoryLayerPlan:
 class HistoryExpertMapCoordinator:
     """Build and share history-based expert maps from rank 0."""
 
+    _cpu_group = None
+
     def __init__(self, load_stats_path: str | None):
         self.load_stats_path = load_stats_path
         self._plans: dict[int, HistoryLayerPlan | None] = {}
@@ -46,9 +48,11 @@ class HistoryExpertMapCoordinator:
         plan = self._build_plan(layer) if self._is_rank0() else None
         if not dist.is_available() or not dist.is_initialized():
             return plan
+        if dist.get_world_size() == 1:
+            return plan
 
         payload: list[HistoryLayerPlan | None] = [plan]
-        dist.broadcast_object_list(payload, src=0)
+        dist.broadcast_object_list(payload, src=0, group=self._get_cpu_group())
         return payload[0]
 
     def _build_plan(self, layer) -> HistoryLayerPlan | None:
@@ -139,3 +143,9 @@ class HistoryExpertMapCoordinator:
         if dist.is_available() and dist.is_initialized():
             return dist.get_rank() == 0
         return True
+
+    @classmethod
+    def _get_cpu_group(cls):
+        if cls._cpu_group is None:
+            cls._cpu_group = dist.new_group(backend="gloo")
+        return cls._cpu_group
