@@ -32,18 +32,22 @@ class ExpertSwap:
 
 
 class HistoryLoadPolicy:
-    """Choose resident experts from this rank's persisted load stats."""
+    """Choose resident experts from persisted load stats."""
 
     def __init__(self, load_stats: ExpertLoadStats | None):
         self.load_stats = load_stats
 
-    def placement_for_layer(self, layer,
-                            num_resident_experts: int) -> ExpertPlacement:
+    def placement_for_layer(
+        self,
+        layer,
+        num_resident_experts: int,
+        global_load: torch.Tensor | None = None,
+    ) -> ExpertPlacement:
         local_num_experts = int(layer.full_local_num_experts)
         num_resident_experts = min(num_resident_experts, local_num_experts)
 
-        resident_ids = self._history_resident_ids(layer,
-                                                  num_resident_experts)
+        resident_ids = self._history_resident_ids(
+            layer, num_resident_experts, global_load)
         if resident_ids is None:
             resident_ids = list(range(num_resident_experts))
 
@@ -54,15 +58,24 @@ class HistoryLoadPolicy:
         ]
         return ExpertPlacement(resident_ids, cold_ids)
 
-    def _history_resident_ids(self, layer,
-                              num_resident_experts: int) -> list[int] | None:
-        if self.load_stats is None or num_resident_experts <= 0:
+    def _history_resident_ids(
+        self,
+        layer,
+        num_resident_experts: int,
+        global_load: torch.Tensor | None = None,
+    ) -> list[int] | None:
+        if num_resident_experts <= 0:
             return None
 
-        try:
-            load = self.load_stats.get_layer_load(int(layer.moe_instance_id))
-        except KeyError:
-            return None
+        load = global_load
+        if load is None:
+            if self.load_stats is None:
+                return None
+            try:
+                load = self.load_stats.get_layer_load(
+                    int(layer.moe_instance_id))
+            except KeyError:
+                return None
 
         if load.numel() != int(layer.global_num_experts):
             return None

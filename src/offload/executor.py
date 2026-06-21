@@ -9,7 +9,7 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 from ..offload_config import OffloadConfig
 from ..loadbalance import (DynamicExpertScheduler, DynamicLoadPolicy,
                            ExpertLoadStats, ExpertPlacement, ExpertSwap,
-                           HistoryLoadPolicy)
+                           HistoryExpertMapCoordinator, HistoryLoadPolicy)
 from .memory_manager import ExpertMemoryManager
 from .routing import LayerRoutingMap
 
@@ -82,6 +82,9 @@ class OffloadExecutor(nn.Module):
         self.prefetch_stream: torch.npu.Stream | None = None
         self.swap_stream: torch.npu.Stream | None = None
         self.load_stats = self._init_load_stats(config)
+        self.history_mapper = (
+            HistoryExpertMapCoordinator(config.load_stats_path)
+            if config.load_balance_mode == "history" else None)
         history_stats = (
             self.load_stats
             if config.load_balance_mode in ("history", "dynamic") else None)
@@ -165,10 +168,18 @@ class OffloadExecutor(nn.Module):
 
     def init_layer_placement(self, layer) -> ExpertPlacement:
         layer_id = layer.moe_instance_id
+        global_load = (
+            self.history_mapper.global_load_for_layer(layer)
+            if self.history_mapper is not None else None)
         placement = self.history_policy.placement_for_layer(
-            layer, layer.resident_local_num_experts)
+            layer, layer.resident_local_num_experts, global_load)
         self.placements[layer_id] = placement
         return placement
+
+    def history_expert_map_for_layer(self, layer) -> torch.Tensor | None:
+        if self.history_mapper is None:
+            return None
+        return self.history_mapper.expert_map_for_layer(layer)
 
     def is_cold_expert(self, layer, local_expert_id: int) -> bool:
         placement = self.placements.get(layer.moe_instance_id)

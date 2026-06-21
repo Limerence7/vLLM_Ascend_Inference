@@ -272,6 +272,12 @@ class OffloadAscendFusedMoE(FusedMoE):
         elif self.dynamic_eplb:
             self.log2phy = determine_default_log2phy_map(
                 self.global_num_experts, self.ep_size, self.ep_rank).npu()
+        history_expert_map = self.offload_executor.history_expert_map_for_layer(
+            self)
+        if history_expert_map is not None:
+            self.local_num_experts = int(
+                torch.sum(history_expert_map != -1).item())
+            self._expert_map = history_expert_map
         self.full_expert_map = self._expert_map
         self.full_local_num_experts = int(
             torch.sum(self.full_expert_map != -1).item()
