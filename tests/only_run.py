@@ -33,6 +33,8 @@ OFFLOAD_CONFIG = OffloadConfig(
     load_balance_mode="dynamic",
     dynamic_update_interval=2,
     dynamic_max_swaps=2,
+    dynamic_min_swap_gain=1,
+    dynamic_cooldown_interval=0,
 )
 
 # TEST_CONFIG = {
@@ -81,8 +83,9 @@ def build_prompts(batch_size: int, max_length: int) -> list[str]:
 
 
 def save_load_stats(llm: LLM) -> None:
-    if OFFLOAD_CONFIG.load_balance_mode != "none":
-        print("Skip load stats save outside load_balance_mode='none'.")
+    if (OFFLOAD_CONFIG.load_balance_mode != "none"
+            or not OFFLOAD_CONFIG.load_stats_path):
+        print("Skip load stats save.")
         return
 
     save_results = llm.collective_rpc(
@@ -106,7 +109,8 @@ if __name__ == "__main__":
     print(f"Offload config: {OFFLOAD_CONFIG}")
 
     sampling_params = SamplingParams(
-        temperature=0.0,
+        temperature=0.7,
+        top_p=0.9,
         max_tokens=TEST_CONFIG["max_new_tokens"],
     )
 

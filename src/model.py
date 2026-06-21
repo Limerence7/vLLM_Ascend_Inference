@@ -16,8 +16,6 @@ OFFLOADED_LAYER_IDS: set[int] = set()
 
 def _layer_id_from_prefix(prefix: str) -> int:
     match = LAYER_ID_PATTERN.search(prefix)
-    if match is None:
-        raise ValueError(f"Cannot parse MoE layer id from prefix: {prefix}")
     return int(match.group(1))
 
 

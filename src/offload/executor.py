@@ -8,7 +8,7 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
 from ..offload_config import OffloadConfig
 from ..loadbalance import (DynamicExpertScheduler, DynamicLoadPolicy,
-                           ExpertLoadStats, ExpertPlacement,
+                           ExpertLoadStats, ExpertPlacement, ExpertSwap,
                            HistoryLoadPolicy)
 from .memory_manager import ExpertMemoryManager
 from .routing import LayerRoutingMap
@@ -80,6 +80,7 @@ class OffloadExecutor(nn.Module):
         self.placements: dict[int, ExpertPlacement] = {}
         self.routing_maps: dict[int, LayerRoutingMap] = {}
         self.prefetch_stream: torch.npu.Stream | None = None
+        self.swap_stream: torch.npu.Stream | None = None
         self.load_stats = self._init_load_stats(config)
         history_stats = (
             self.load_stats
@@ -92,8 +93,16 @@ class OffloadExecutor(nn.Module):
         if not self.dynamic_load_balance:
             return None
 
-        policy = DynamicLoadPolicy(self.load_stats, config.dynamic_max_swaps)
-        return DynamicExpertScheduler(policy, config.dynamic_update_interval)
+        policy = DynamicLoadPolicy(
+            self.load_stats,
+            config.dynamic_max_swaps,
+            config.dynamic_min_swap_gain,
+        )
+        return DynamicExpertScheduler(
+            policy,
+            config.dynamic_update_interval,
+            config.dynamic_cooldown_interval,
+        )
 
     def _init_load_stats(self,
                          config: OffloadConfig) -> ExpertLoadStats | None:
@@ -114,10 +123,7 @@ class OffloadExecutor(nn.Module):
 
         self.num_buffers = self.config.num_buffers
         template_id = self.layer_ids[0]
-        template_weights = self.memory_manager.get_expert_weights(
-            template_id,
-            self.placements[template_id].cold_expert_ids,
-        )
+        template_weights = self.memory_manager.get_expert_weights(template_id)
         num_experts = max(
             len(placement.cold_expert_ids)
             for placement in self.placements.values()
@@ -158,14 +164,14 @@ class OffloadExecutor(nn.Module):
         )
 
     def init_layer_placement(self, layer) -> ExpertPlacement:
-        layer_id = int(layer.moe_instance_id)
+        layer_id = layer.moe_instance_id
         placement = self.history_policy.placement_for_layer(
-            layer, int(layer.resident_local_num_experts))
+            layer, layer.resident_local_num_experts)
         self.placements[layer_id] = placement
         return placement
 
     def is_cold_expert(self, layer, local_expert_id: int) -> bool:
-        placement = self.placements.get(int(layer.moe_instance_id))
+        placement = self.placements.get(layer.moe_instance_id)
         if placement is None:
             return False
         return local_expert_id in placement.cold_slots
@@ -216,7 +222,7 @@ class OffloadExecutor(nn.Module):
         current_layer = layer.moe_instance_id
         if not self.cold_experts:
             self.init_cold_buffers()
-        if self._can_update_dynamic_placement():
+        if self.dynamic_scheduler is not None and not self.offload_full_layer:
             self.dynamic_scheduler.maybe_update(self, layer)
         if current_layer == self.buffer_status[self.buffer_idx]:
             cold_expert = self.cold_experts[self.buffer_idx]
@@ -227,7 +233,8 @@ class OffloadExecutor(nn.Module):
         if self.offload_full_layer:
             return PreparedColdExperts(cold_expert, None, None)
 
-        cold_topk_ids, cold_mask = self.build_cold_routing(layer, topk_ids)
+        cold_topk_ids, cold_mask = self.routing_maps[
+            layer.moe_instance_id].cold_routing(topk_ids)
         return PreparedColdExperts(cold_expert, cold_topk_ids, cold_mask)
 
     def prefetch_next_layers(self, layer) -> None:
@@ -252,31 +259,41 @@ class OffloadExecutor(nn.Module):
                     self.memory_manager.copy_experts_to_module(
                         current_layer, cold_expert_ids, cold_expert)
             else:
-                weights = self.memory_manager.get_expert_weights(
-                    current_layer, cold_expert_ids)
+                weights = self.memory_manager.get_expert_weights(current_layer)
                 cold_expert.load_from_cpu(weights)
         cold_expert.load_stream = stream
         self.buffer_status[buffer_id] = current_layer
         return cold_expert
 
-    def build_cold_routing(self, layer, topk_ids: torch.Tensor) -> tuple[
-            torch.Tensor, torch.Tensor]:
-        return self.routing_maps[layer.moe_instance_id].cold_routing(topk_ids)
-
-    def commit_layer_placement(self, layer,
-                               placement: ExpertPlacement) -> None:
+    def commit_layer_placement(
+        self,
+        layer,
+        placement: ExpertPlacement,
+        swaps: list[ExpertSwap] | None = None,
+    ) -> None:
         layer_id = int(layer.moe_instance_id)
         self.placements[layer_id] = placement
-        self.routing_maps[layer_id] = LayerRoutingMap(layer, placement)
-        layer.apply_expert_placement(placement)
-        self._invalidate_layer_buffers(layer_id)
+        if self.dynamic_load_balance and swaps:
+            self.routing_maps[layer_id].apply_placement(placement, swaps)
+            layer.apply_expert_placement(placement, swaps)
+            self._patch_loaded_cold_buffers(layer_id, swaps)
+        else:
+            self.routing_maps[layer_id] = LayerRoutingMap(layer, placement)
+            layer.apply_expert_placement(placement)
+            self._invalidate_layer_buffers(layer_id)
 
-    def copy_expert_to_resident(self, layer, local_expert_id: int,
-                                resident_slot: int) -> None:
+    def copy_swaps_to_resident(self, layer,
+                               swaps: list[ExpertSwap]) -> None:
         layer_id = int(layer.moe_instance_id)
-        with torch.no_grad():
+        expert_ids = [swap.swap_in for swap in swaps]
+        target_slots = [swap.resident_slot for swap in swaps]
+        if self.swap_stream is None:
+            self.swap_stream = torch.npu.Stream()
+        stream = self.swap_stream
+        with torch.npu.stream(stream), torch.no_grad():
             self.memory_manager.copy_experts_to_module(
-                layer_id, [local_expert_id], layer, [resident_slot])
+                layer_id, expert_ids, layer, target_slots)
+        torch.npu.current_stream().wait_stream(stream)
 
     def _invalidate_layer_buffers(self, layer_id: int) -> None:
         self.buffer_status = [
@@ -284,32 +301,34 @@ class OffloadExecutor(nn.Module):
             for status in self.buffer_status
         ]
 
-    def _can_update_dynamic_placement(self) -> bool:
-        return (
-            self.dynamic_scheduler is not None
-            and not self.offload_full_layer
-        )
+    def _patch_loaded_cold_buffers(self, layer_id: int,
+                                   swaps: list[ExpertSwap]) -> None:
+        expert_ids = [swap.swap_out for swap in swaps]
+        target_slots = [swap.cold_slot for swap in swaps]
+        if self.prefetch_stream is None:
+            self.prefetch_stream = torch.npu.Stream()
+        stream = self.prefetch_stream
+        for buffer_id, status in enumerate(self.buffer_status):
+            if status != layer_id:
+                continue
+            cold_expert = self.cold_experts[buffer_id]
+            if cold_expert.load_stream is not None:
+                stream.wait_stream(cold_expert.load_stream)
+            with torch.npu.stream(stream), torch.no_grad():
+                self.memory_manager.copy_experts_to_module(
+                    layer_id, expert_ids, cold_expert, target_slots)
+            cold_expert.load_stream = stream
 
     def _stored_expert_ids(self, layer,
                            placement: ExpertPlacement) -> list[int]:
         if self.dynamic_load_balance:
-            return list(range(int(layer.full_local_num_experts)))
+            return list(range(layer.full_local_num_experts))
         return placement.cold_expert_ids
 
     def record_load(self, layer, topk_ids: torch.Tensor) -> None:
         if self.load_stats is not None:
-            self.load_stats.record(int(layer.moe_instance_id), topk_ids)
+            self.load_stats.record(layer.moe_instance_id, topk_ids)
 
     def save_load_stats(self) -> None:
         if self.load_stats is not None:
             self.load_stats.save()
-
-    def summary(self) -> dict[str, object]:
-        summary = self.memory_manager.summary()
-        summary["mode"] = self.config.mode
-        summary["load_balance_mode"] = self.config.load_balance_mode
-        summary["load_stats_path"] = self.config.load_stats_path
-        summary["num_layers"] = len(self.layers)
-        summary["num_cold_expert_buffers"] = len(self.cold_experts)
-        summary["buffer_status"] = self.buffer_status.copy()
-        return summary

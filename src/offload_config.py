@@ -17,6 +17,8 @@ class OffloadConfig:
     load_balance_mode: str = "none"
     dynamic_update_interval: int = 32
     dynamic_max_swaps: int = 2
+    dynamic_min_swap_gain: int = 0
+    dynamic_cooldown_interval: int = 0
 
     def validate(self) -> None:
         self.mode = self.mode.strip().lower()
@@ -26,13 +28,17 @@ class OffloadConfig:
         assert self.load_balance_mode in LOAD_BALANCE_MODES, (
             f"{self.load_balance_mode} is not supported for load balance.")
         assert self.interval > 0, "Offload Interval must be positive"
-        assert self.num_buffers >= 2, (
-            "Offload needs at least two cold expert buffers.")
+        # assert self.num_buffers >= 2, (
+        #     "Offload needs at least two cold expert buffers.")
         assert self.num_hot_experts >= 0, "num_hot_experts must be non-negative."
         assert self.dynamic_update_interval > 0, (
             "dynamic_update_interval must be positive.")
         assert self.dynamic_max_swaps >= 0, (
             "dynamic_max_swaps must be non-negative.")
+        assert self.dynamic_min_swap_gain >= 0, (
+            "dynamic_min_swap_gain must be non-negative.")
+        assert self.dynamic_cooldown_interval >= 0, (
+            "dynamic_cooldown_interval must be non-negative.")
 
     @property
     def offload_full_layers(self) -> bool:

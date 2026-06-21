@@ -1,7 +1,7 @@
 import torch
 
 from ..layer.routing import map_expert_ids
-from ..loadbalance import ExpertPlacement
+from ..loadbalance import ExpertPlacement, ExpertSwap
 
 
 class LayerRoutingMap:
@@ -27,6 +27,23 @@ class LayerRoutingMap:
         cold_mask = is_local & (cold_expert_ids >= 0)
         cold_topk_ids = cold_expert_ids.masked_fill(~cold_mask, 0)
         return cold_topk_ids.to(topk_ids.dtype), cold_mask
+
+    def apply_placement(self, placement: ExpertPlacement,
+                        swaps: list[ExpertSwap] | None = None) -> None:
+        if not swaps:
+            self.local_to_cold_expert = self._build_local_to_cold_expert(
+                placement)
+            self._device_maps.clear()
+            return
+
+        for swap in swaps:
+            self._set_cold_slot(swap.swap_in, -1)
+            self._set_cold_slot(swap.swap_out, swap.cold_slot)
+
+    def _set_cold_slot(self, local_expert_id: int, cold_slot: int) -> None:
+        self.local_to_cold_expert[local_expert_id] = cold_slot
+        for _, local_to_cold_expert in self._device_maps.values():
+            local_to_cold_expert[local_expert_id] = cold_slot
 
     def _maps_for(self, device: torch.device) -> tuple[torch.Tensor,
                                                        torch.Tensor]:

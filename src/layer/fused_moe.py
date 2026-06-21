@@ -207,6 +207,7 @@ class OffloadAscendFusedMoE(FusedMoE):
         self.full_expert_map = None
         self.full_local_num_experts = 0
         self.resident_local_num_experts = 0
+        self._global_ids_by_local_expert: list[list[int]] = []
         self._resident_maps_by_device: dict[torch.device, torch.Tensor] = {}
         self.log2phy = None
 
@@ -275,6 +276,8 @@ class OffloadAscendFusedMoE(FusedMoE):
         self.full_local_num_experts = int(
             torch.sum(self.full_expert_map != -1).item()
             if self.full_expert_map is not None else self.global_num_experts)
+        self._global_ids_by_local_expert = (
+            self._build_global_ids_by_local_expert())
         self.resident_local_num_experts = self._resident_local_num_experts()
         self.expert_placement = self.offload_executor.init_layer_placement(
             self)
@@ -397,10 +400,49 @@ class OffloadAscendFusedMoE(FusedMoE):
     def update_expert_map(self, new_expert_map):
         self._expert_map = new_expert_map
 
-    def apply_expert_placement(self, placement) -> None:
+    def apply_expert_placement(self, placement, swaps=None) -> None:
         self.expert_placement = placement
+        if swaps:
+            self._apply_expert_swaps(swaps)
+            return
+
         self._expert_map = self._build_resident_expert_map()
         self._resident_maps_by_device.clear()
+
+    def _apply_expert_swaps(self, swaps) -> None:
+        if self._expert_map is None:
+            self._expert_map = self._build_resident_expert_map()
+            self._resident_maps_by_device.clear()
+            return
+
+        for swap in swaps:
+            for global_id in self._global_ids_for_local_expert(swap.swap_out):
+                self._set_resident_map_entry(global_id, -1)
+            for global_id in self._global_ids_for_local_expert(swap.swap_in):
+                self._set_resident_map_entry(global_id, swap.resident_slot)
+
+    def _set_resident_map_entry(self, global_expert_id: int,
+                                resident_slot: int) -> None:
+        self._expert_map[global_expert_id] = resident_slot
+        for device_map in self._resident_maps_by_device.values():
+            device_map[global_expert_id] = resident_slot
+
+    def _global_ids_for_local_expert(self, local_expert_id: int) -> list[int]:
+        return self._global_ids_by_local_expert[local_expert_id]
+
+    def _build_global_ids_by_local_expert(self) -> list[list[int]]:
+        if self.full_expert_map is None:
+            return [[expert_id]
+                    for expert_id in range(int(self.global_num_experts))]
+
+        global_ids_by_local = [
+            [] for _ in range(int(self.full_local_num_experts))
+        ]
+        full_map = self.full_expert_map.detach().cpu()
+        for global_id, local_id in enumerate(full_map.tolist()):
+            if local_id >= 0:
+                global_ids_by_local[int(local_id)].append(int(global_id))
+        return global_ids_by_local
 
     def get_log2phy_map(self):
         return self.log2phy

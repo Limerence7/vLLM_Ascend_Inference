@@ -169,7 +169,8 @@ class OffloadFusedMoEMethod:
             topk_ids = torch.argsort(
                 random_matrix, dim=1)[:, :topk_ids.size(1)].to(topk_ids.dtype)
 
-        layer.offload_executor.record_load(layer, topk_ids)
+        if layer.offload_executor.load_stats is not None:
+            layer.offload_executor.record_load(layer, topk_ids)
 
         moe_comm_method = get_forward_context().moe_comm_method
         mc2_mask = kwargs.get("mc2_mask")
@@ -219,7 +220,7 @@ class OffloadUnquantizedFusedMoEMethod(OffloadFusedMoEMethod,
                        topk_weights, topk_ids, global_num_experts, expert_map,
                        shared_experts, apply_router_weight_on_input,
                        dynamic_eplb, mc2_mask, pertoken_scale):
-        local_num_experts = int(experts.w13_weight.shape[0])
+        local_num_experts = experts.w13_weight.shape[0]
         with dispatch_with_local_experts(moe_comm_method, local_num_experts):
             return moe_comm_method.fused_experts(
                 hidden_states=hidden_states,

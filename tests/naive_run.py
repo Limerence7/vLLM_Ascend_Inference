@@ -11,7 +11,7 @@ from vllm import LLM, SamplingParams
 Inference_Config = {
     "Qwen3-30B-A3B": {
         "model_path": "/workspace/models/Qwen3-30B-A3B",
-        "batch_size": 256,
+        "batch_size": 1024,
         "max_length": 256,
         "max_new_tokens": 256,
         "world_size": 2,
@@ -19,13 +19,13 @@ Inference_Config = {
     },
     "Qwen3-235B-A22B": {
         "model_path": "/workspace/models/Qwen3-235B-A22B",
-        "batch_size": 128,
+        "batch_size": 512,
         "max_length": 64,
         "max_new_tokens": 64,
         "world_size": 8,
         "utilization": 0.98,
     },
-    "Qwen3-235B-A22B": {
+    "Qwen3-235B-A22B-W8A8": {
         "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
         "batch_size": 1024,
         "max_length": 512,
@@ -35,7 +35,7 @@ Inference_Config = {
     },
 }
 
-current_config = Inference_Config["Qwen3-30B-A3B"]
+current_config = Inference_Config["Qwen3-235B-A22B"]
 
 def load_contents_from_jsonl(jsonl_path):
     contents = []
@@ -52,6 +52,7 @@ def load_contents_from_jsonl(jsonl_path):
                 text += (human + assistant)
             if len(text) >= 1024:
                 contents.append(text)
+    random.shuffle(contents)
     return contents
 
 if __name__ == "__main__":
