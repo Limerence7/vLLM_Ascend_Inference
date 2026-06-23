@@ -1,14 +1,14 @@
 import src
 from pathlib import Path
 
-from src.offload_config import OffloadConfig
+from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
 
-LOAD_STATS_PATH = (
+LOAD_HISTORY_PATH = (
     Path(__file__).resolve().parents[1]
     / "load_records"
-    / "only_run_load_stats"
+    / "only_run_load_history"
 )
 
 TEST_CONFIG = {
@@ -22,19 +22,15 @@ TEST_CONFIG = {
     "utilization": 0.85,
 }
 
-OFFLOAD_CONFIG = OffloadConfig(
-    mode="manual",
+RUNTIME_CONFIG = RuntimeConfig(
+    runtime_mode="offload",
     interval=16,
     num_buffers=2,
-    num_hot_experts=56,
+    num_hot_experts=60,
     cpu_pin_memory=True,
-    offloaded_layer_ids=[],
-    load_stats_path=str(LOAD_STATS_PATH),
-    load_balance_mode="dynamic",
-    dynamic_update_interval=2,
-    dynamic_max_swaps=2,
-    dynamic_min_swap_gain=1,
-    dynamic_cooldown_interval=0,
+    runtime_layer_ids=[],
+    load_history_path=str(LOAD_HISTORY_PATH),
+    enable_history_mapping=False,
 )
 
 # TEST_CONFIG = {
@@ -46,13 +42,13 @@ OFFLOAD_CONFIG = OffloadConfig(
 #     "utilization": 0.98,
 # }
 
-# OFFLOAD_CONFIG = OffloadConfig(
-#     mode="manual",
+# RUNTIME_CONFIG = RuntimeConfig(
+#     runtime_mode="offload",
 #     interval=16,
 #     num_buffers=2,
 #     num_hot_experts=8,
 #     cpu_pin_memory=True,
-#     offloaded_layer_ids=[],
+#     runtime_layer_ids=[],
 # )
 
 # TEST_CONFIG = {
@@ -66,13 +62,13 @@ OFFLOAD_CONFIG = OffloadConfig(
 #     "utilization": 0.85,
 # }
 
-# OFFLOAD_CONFIG = OffloadConfig(
-#     mode="manual",
+# RUNTIME_CONFIG = RuntimeConfig(
+#     runtime_mode="offload",
 #     interval=16,
 #     num_buffers=2,
 #     num_hot_experts=8,
 #     cpu_pin_memory=True,
-#     offloaded_layer_ids=[],
+#     runtime_layer_ids=[],
 # )
 
 
@@ -82,20 +78,19 @@ def build_prompts(batch_size: int, max_length: int) -> list[str]:
     return [prompt for _ in range(batch_size)]
 
 
-def save_load_stats(llm: LLM) -> None:
-    if (OFFLOAD_CONFIG.load_balance_mode != "none"
-            or not OFFLOAD_CONFIG.load_stats_path):
+def save_load_history(llm: LLM) -> None:
+    if not RUNTIME_CONFIG.load_history_path:
         print("Skip load stats save.")
         return
 
     save_results = llm.collective_rpc(
-        "save_load_stats",
+        "save_load_history",
         timeout=120,
     )
     if not all(result.get("saved") for result in save_results):
-        raise RuntimeError(f"Failed to save load stats: {save_results}")
-    print(f"Load stats worker results: {save_results}")
-    print(f"Load stats saved under: {LOAD_STATS_PATH}")
+        raise RuntimeError(f"Failed to save load history: {save_results}")
+    print(f"Load history worker results: {save_results}")
+    print(f"Load history saved under: {LOAD_HISTORY_PATH}")
 
 
 def shutdown_llm(llm: LLM) -> None:
@@ -103,10 +98,10 @@ def shutdown_llm(llm: LLM) -> None:
 
 
 if __name__ == "__main__":
-    src.register_plugin(OFFLOAD_CONFIG)
+    src.register_plugin(RUNTIME_CONFIG)
 
     print("Loading model...")
-    print(f"Offload config: {OFFLOAD_CONFIG}")
+    print(f"Runtime config: {RUNTIME_CONFIG}")
 
     sampling_params = SamplingParams(
         temperature=0.7,
@@ -124,14 +119,14 @@ if __name__ == "__main__":
         dtype="bfloat16",
         # quantization='ascend',
         enforce_eager=True,
-        worker_extension_cls="src.utils.OffloadWorkerExtension",
+        worker_extension_cls="src.utils.RuntimeWorkerExtension",
     )
 
     outputs = llm.generate(
         build_prompts(TEST_CONFIG["batch_size"], TEST_CONFIG["max_length"]),
         sampling_params,
     )
-    save_load_stats(llm)
+    save_load_history(llm)
     shutdown_llm(llm)
 
     for output in outputs:
