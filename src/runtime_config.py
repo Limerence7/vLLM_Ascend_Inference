@@ -21,6 +21,7 @@ class RuntimeConfig:
     num_redundant_experts: int = 0
     imbalance_threshold: float = 0.2
     scheduler_interval: int = 16
+    num_experts_per_update: int = 1
 
     def validate(self) -> None:
         self.runtime_mode = self.runtime_mode.strip().lower()
@@ -38,6 +39,8 @@ class RuntimeConfig:
             'num_redundant_experts must be non-negative.')
         assert self.scheduler_interval > 0, (
             'scheduler_interval must be a positive integer.')
+        assert self.num_experts_per_update > 0, (
+            'num_experts_per_update must be a positive integer.')
 
     @property
     def offload_layer_wise(self) -> bool:

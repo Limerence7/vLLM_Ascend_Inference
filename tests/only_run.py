@@ -5,28 +5,45 @@ from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
 
+# LOAD_HISTORY_PATH = (
+#     Path(__file__).resolve().parents[1]
+#     / "load_records"
+#     / "only_run_load_history"
+# )
+
+# TEST_CONFIG = {
+#     "model_path": "/workspace/models/Qwen3-30B-A3B",
+#     "batch_size": 1,
+#     "max_length": 32,
+#     "max_new_tokens": 8,
+#     "max_num_batched_tokens": 64,
+#     "max_num_seqs": 1,
+#     "world_size": 2,
+#     "utilization": 0.85,
+# }
+
 LOAD_HISTORY_PATH = (
     Path(__file__).resolve().parents[1]
     / "load_records"
-    / "only_run_load_history"
+    / "only_run_235b_w8a8"
 )
-
 TEST_CONFIG = {
-    "model_path": "/workspace/models/Qwen3-30B-A3B",
+    "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
     "batch_size": 1,
     "max_length": 32,
     "max_new_tokens": 8,
     "max_num_batched_tokens": 64,
     "max_num_seqs": 1,
-    "world_size": 2,
+    "world_size": 8,
     "utilization": 0.85,
 }
 
 RUNTIME_CONFIG = RuntimeConfig(
-    runtime_mode="offload",
+    runtime_mode="balance",
     interval=16,
     num_buffers=2,
-    num_hot_experts=60,
+    num_redundant_experts=1,
+    num_experts_per_update=1,
     cpu_pin_memory=True,
     runtime_layer_ids=[],
     load_history_path=str(LOAD_HISTORY_PATH),
@@ -116,8 +133,10 @@ if __name__ == "__main__":
         trust_remote_code=True,
         gpu_memory_utilization=TEST_CONFIG["utilization"],
         max_model_len=TEST_CONFIG["max_length"] + TEST_CONFIG["max_new_tokens"],
-        dtype="bfloat16",
-        # quantization='ascend',
+        max_num_batched_tokens=TEST_CONFIG["max_num_batched_tokens"],
+        max_num_seqs=TEST_CONFIG["max_num_seqs"],
+        # dtype="bfloat16",
+        quantization='ascend',
         enforce_eager=True,
         worker_extension_cls="src.utils.RuntimeWorkerExtension",
     )

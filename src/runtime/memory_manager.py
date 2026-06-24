@@ -92,6 +92,18 @@ class CpuExpertWeights:
                     if fp32_target is not None:
                         fp32_target[target_slot].copy_(
                             tensor[source_slot], non_blocking=True)
+                self._copy_to_tensor_list(module, name, target_slot)
+                if name == "w13_weight_scale":
+                    self._copy_to_tensor_list(
+                        module, "w13_weight_scale_fp32", target_slot)
+
+    @staticmethod
+    def _copy_to_tensor_list(module, name: str, target_slot: int) -> None:
+        tensor_list = getattr(module, f"{name}_list", None)
+        if tensor_list is None:
+            return
+        tensor_list[target_slot].copy_(getattr(module, name)[target_slot],
+                                      non_blocking=True)
 
     @staticmethod
     def _empty_cpu_like(

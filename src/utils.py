@@ -4,17 +4,27 @@ class RuntimeWorkerExtension:
     def save_load_history(self) -> dict[str, object]:
         from .layer.fused_moe import RuntimeAscendFusedMoE
 
-        executor = RuntimeAscendFusedMoE.executor
-        if executor is None:
+        recorder = (RuntimeAscendFusedMoE.lbvc_adaptor
+                    or RuntimeAscendFusedMoE.executor
+                    or RuntimeAscendFusedMoE.load_profiler)
+        if recorder is None:
             return {
                 "saved": False,
                 "reason": "runtime executor is not initialized",
             }
 
-        executor.save_load_history()
+        if hasattr(recorder, "save_load_history"):
+            recorder.save_load_history()
+            profiler = recorder.profiler
+            num_layers = len(recorder.layers)
+        else:
+            recorder.save()
+            profiler = recorder
+            num_layers = len(recorder._local_to_global)
+
         return {
-            "saved": executor.profiler.path is not None,
-            "load_history_path": executor.config.load_history_path,
-            "output_path": executor.profiler.output_path,
-            "num_layers": len(executor.layers),
+            "saved": profiler.path is not None,
+            "load_history_path": profiler.path,
+            "output_path": profiler.output_path,
+            "num_layers": num_layers,
         }

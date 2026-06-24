@@ -38,6 +38,10 @@ class ExpertLoadProfiler:
             torch.zeros(num_experts, dtype=torch.long, device="cpu"),
         )
 
+    def update_layer_map(self, layer) -> None:
+        self._local_to_global[int(layer.moe_instance_id)] = (
+            self._build_local_to_global(layer))
+
     def record_expert_tokens(
         self,
         layer_id: int,

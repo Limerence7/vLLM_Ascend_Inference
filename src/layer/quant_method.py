@@ -82,7 +82,8 @@ class RuntimeFusedMoEMethod:
                               log2phy, global_redundant_expert_num,
                               shared_experts, apply_router_weight_on_input,
                               mc2_mask, pertoken_scale):
-        collect_load = layer.runtime_config.runtime_mode == "profile"
+        collect_load = layer.runtime_config.runtime_mode in (
+            "profile", "balance")
         return self._fused_experts(
             layer=layer,
             moe_comm_method=moe_comm_method,
@@ -269,7 +270,10 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
             if get_ascend_device_type() != AscendDeviceType._310P:
                 getattr(layer, name).data = maybe_trans_nz(
                     getattr(layer, name).data)
-        layer.exo_executor.process_layer_after_loading(layer, self)
+        if layer.runtime_config.runtime_mode == "balance":
+            layer.lbvc_adaptor.process_layer_after_loading(layer, self)
+        elif layer.runtime_config.runtime_mode == "offload":
+            layer.exo_executor.process_layer_after_loading(layer, self)
 
     def process_offloaded_weights(self,
                                   tensors: dict[str, torch.Tensor]) -> None:
@@ -302,6 +306,7 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 dynamic_eplb=dynamic_eplb,
                 mc2_mask=mc2_mask,
+                pertoken_scale=pertoken_scale,
                 **eplb_kwargs)
 
 
@@ -314,12 +319,20 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
         self.quant_method = method.quant_method
         self.dynamic_eplb = self.quant_method.dynamic_eplb
 
+    def disable_native_dynamic_eplb(self) -> None:
+        self.dynamic_eplb = False
+        self.quant_method.dynamic_eplb = False
+
     def create_weights(self, *args, **kwargs):
         return self.base_method.create_weights(*args, **kwargs)
 
     def process_weights_after_loading(self, layer):
         self.base_method.process_weights_after_loading(layer)
-        layer.exo_executor.process_layer_after_loading(layer, self)
+        if layer.runtime_config.runtime_mode == "balance":
+            self._prepare_balance_weight_views(layer)
+            layer.lbvc_adaptor.process_layer_after_loading(layer, self)
+        elif layer.runtime_config.runtime_mode == "offload":
+            layer.exo_executor.process_layer_after_loading(layer, self)
 
     def process_offloaded_weights(self,
                                   tensors: dict[str, torch.Tensor]) -> None:
@@ -340,6 +353,11 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                     if context.moe_comm_type == MoECommType.FUSED_MC2
                     and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2 else
                     experts.w2_weight_scale)
+        w1 = getattr(experts, "w13_weight_list", [experts.w13_weight])
+        w1_scale = getattr(experts, "w13_weight_scale_fp32_list",
+                           [experts.w13_weight_scale_fp32])
+        w2 = getattr(experts, "w2_weight_list", [experts.w2_weight])
+        w2_scale = getattr(experts, "w2_weight_scale_list", [w2_scale])
         local_num_experts = int(experts.w13_weight.shape[0])
         eplb_kwargs = {}
         if log2phy is not None:
@@ -351,10 +369,10 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
             return moe_comm_method.fused_experts(
                 hidden_states=hidden_states,
                 pertoken_scale=pertoken_scale,
-                w1=[experts.w13_weight],
-                w1_scale=[experts.w13_weight_scale_fp32],
-                w2=[experts.w2_weight],
-                w2_scale=[w2_scale],
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 global_num_experts=global_num_experts,
@@ -364,6 +382,23 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                 dynamic_eplb=dynamic_eplb,
                 mc2_mask=mc2_mask,
                 **eplb_kwargs)
+
+    @staticmethod
+    def _prepare_balance_weight_views(layer) -> None:
+        layer.w13_weight_list = [
+            weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)
+        ]
+        layer.w2_weight_list = [
+            weight.clone() for weight in layer.w2_weight.data.unbind(dim=0)
+        ]
+        layer.w13_weight_scale_fp32_list = [
+            weight.clone()
+            for weight in layer.w13_weight_scale_fp32.data.unbind(dim=0)
+        ]
+        layer.w2_weight_scale_list = [
+            weight.clone()
+            for weight in layer.w2_weight_scale.data.unbind(dim=0)
+        ]
 
 
 def wrap_quant_method(method):

@@ -29,6 +29,7 @@ from vllm_ascend.quantization.w8a8_dynamic import \
     AscendW8A8DynamicFusedMoEMethod
 from vllm_ascend.utils import npu_stream_switch
 
+from ..moeload.profiler import ExpertLoadProfiler
 from ..runtime_config import get_runtime_config
 from ..runtime.routing import ExpertPlacement
 from .moe_comm_method import setup_moe_comm_method
@@ -53,6 +54,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
     gate_stream: torch.npu.Stream | None = None
     executor = None
     lbvc_adaptor = None
+    load_profiler = None
 
     @classmethod
     def reset_runtime(cls) -> None:
@@ -60,6 +62,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
         cls.gate_stream = None
         cls.executor = None
         cls.lbvc_adaptor = None
+        cls.load_profiler = None
 
     def __init__(
         self,
@@ -224,7 +227,8 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.uses_w8a8 = isinstance(self.quant_method,
                                     RuntimeW8A8DynamicFusedMoEMethod)
         self.runtime_config = get_runtime_config()
-        if RuntimeAscendFusedMoE.executor is None:
+        if (self.runtime_config.runtime_mode == "offload"
+                and RuntimeAscendFusedMoE.executor is None):
             from ..runtime.exo_executor import ExoExecutor
 
             RuntimeAscendFusedMoE.executor = ExoExecutor(
@@ -237,6 +241,17 @@ class RuntimeAscendFusedMoE(FusedMoE):
             RuntimeAscendFusedMoE.lbvc_adaptor = LBVCAdaptor(
                 self.runtime_config)
         self.lbvc_adaptor = RuntimeAscendFusedMoE.lbvc_adaptor
+        if (self.runtime_config.runtime_mode == "profile"
+                and RuntimeAscendFusedMoE.load_profiler is None):
+            RuntimeAscendFusedMoE.load_profiler = ExpertLoadProfiler(
+                self.runtime_config.load_history_path,
+                metadata={
+                    "runtime_mode": self.runtime_config.runtime_mode,
+                    "runtime_layer_ids":
+                    list(self.runtime_config.runtime_layer_ids),
+                },
+            )
+        self.load_profiler = RuntimeAscendFusedMoE.load_profiler
 
         self.moe_config.tp_group = get_tp_group()
         self.moe_config.dp_group = get_dp_group()
@@ -246,6 +261,10 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.dynamic_eplb = (
             ascend_config.dynamic_eplb
             or ascend_config.expert_map_record_path)
+        if self.runtime_config.runtime_mode == "balance":
+            self.dynamic_eplb = False
+            if hasattr(self.quant_method, "disable_native_dynamic_eplb"):
+                self.quant_method.disable_native_dynamic_eplb()
         self.expert_map_path = ascend_config.expert_map_path
         self.global_redundant_expert_num = ascend_config.init_redundancy_expert
         self.global_num_experts = num_experts + self.global_redundant_expert_num
@@ -263,7 +282,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
 
         if self.runtime_config.runtime_mode == "balance":
             assert self.lbvc_adaptor is not None
-            global_load = self.exo_executor.global_load_for_layer(self)
+            global_load = self.lbvc_adaptor.global_load_for_layer(self)
             self.local_num_experts, self._expert_map, self.log2phy = (
                 self.lbvc_adaptor.initial_expert_maps(
                     num_experts=num_experts,
@@ -301,6 +320,23 @@ class RuntimeAscendFusedMoE(FusedMoE):
         elif self.runtime_config.runtime_mode != "balance" and self.dynamic_eplb:
             self.log2phy = determine_default_log2phy_map(
                 self.global_num_experts, self.ep_size, self.ep_rank).npu()
+        if self.runtime_config.runtime_mode == "offload" and not init_eplb_enable:
+            history_expert_map = self.exo_executor.history_expert_map_for_layer(
+                self)
+            if history_expert_map is not None:
+                if history_expert_map.numel() != int(self.global_num_experts):
+                    logger.warning(
+                        "Ignore history expert map for layer %s: expected %s "
+                        "entries, got %s.", self.moe_instance_id,
+                        self.global_num_experts, history_expert_map.numel())
+                else:
+                    self._expert_map = history_expert_map
+                    self.local_num_experts = int(
+                        torch.sum(self._expert_map != -1).item())
+                    logger.info(
+                        "[EP Rank %s/%s] Layer %s uses history expert map: %s.",
+                        self.ep_rank, self.ep_size, self.moe_instance_id,
+                        get_compressed_expert_map(self._expert_map))
         self.full_expert_map = self._expert_map
         self.full_local_num_experts = int(
             torch.sum(self.full_expert_map != -1).item()
@@ -346,9 +382,15 @@ class RuntimeAscendFusedMoE(FusedMoE):
                 in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod")):
             moe_quant_params["intermediate_size_full"] = intermediate_size
         self.quant_method.create_weights(layer=self, **moe_quant_params)
-        self.exo_executor.register_layer(self)
-        if self.lbvc_adaptor is not None:
+        if self.runtime_config.runtime_mode == "balance":
+            assert self.lbvc_adaptor is not None
             self.lbvc_adaptor.register_layer(self)
+        elif self.runtime_config.runtime_mode == "profile":
+            assert self.load_profiler is not None
+            self.load_profiler.register_layer(self)
+        else:
+            assert self.exo_executor is not None
+            self.exo_executor.register_layer(self)
 
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
@@ -541,9 +583,18 @@ class RuntimeAscendFusedMoE(FusedMoE):
                       return_success: bool = False) -> bool | None:
         param_name = next((name for name in EXPERT_WEIGHT_NAMES
                            if getattr(self, name, None) is param), None)
-        load_runtime_weights = self.exo_executor.load_weight(
-            self, param_name or weight_name, shard_id, expert_id,
-            loaded_weight)
+        if self.runtime_config.runtime_mode == "balance":
+            assert self.lbvc_adaptor is not None
+            load_runtime_weights = self.lbvc_adaptor.load_weight(
+                self, param_name or weight_name, shard_id, expert_id,
+                loaded_weight)
+        elif self.runtime_config.runtime_mode == "offload":
+            assert self.exo_executor is not None
+            load_runtime_weights = self.exo_executor.load_weight(
+                self, param_name or weight_name, shard_id, expert_id,
+                loaded_weight)
+        else:
+            load_runtime_weights = False
         if load_runtime_weights:
             return True if return_success else None
 
@@ -557,12 +608,14 @@ class RuntimeAscendFusedMoE(FusedMoE):
         forward_context = get_forward_context()
         enable_force_load_balance = forward_context.in_profile_run
 
-        hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
+        moe_comm_method = forward_context.moe_comm_method
+        hidden_states, router_logits, mc2_mask, context_metadata = (
+            moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
             replace_allreduce=forward_context.sp_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
-            quant_type=self.quant_type)
+            quant_type=self.quant_type))
 
         if isinstance(hidden_states, tuple):
             hidden_states, pertoken_scale = hidden_states
@@ -596,8 +649,18 @@ class RuntimeAscendFusedMoE(FusedMoE):
 
         if isinstance(final_hidden_states, tuple):
             final_hidden_states, group_list_type, expert_tokens = final_hidden_states
-            self.exo_executor.record_expert_tokens(
-                self, group_list_type, expert_tokens)
+            if self.runtime_config.runtime_mode == "balance":
+                assert self.lbvc_adaptor is not None
+                self.lbvc_adaptor.record_expert_tokens(
+                    self, group_list_type, expert_tokens)
+            elif self.runtime_config.runtime_mode == "offload":
+                assert self.exo_executor is not None
+                self.exo_executor.record_expert_tokens(
+                    self, group_list_type, expert_tokens)
+            else:
+                assert self.load_profiler is not None
+                self.load_profiler.record_expert_tokens(
+                    int(self.moe_instance_id), expert_tokens, group_list_type)
             if self.dynamic_eplb:
                 self._record_moe_load(group_list_type, expert_tokens)
 

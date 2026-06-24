@@ -6,30 +6,46 @@ from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
 
+# LOAD_HISTORY_PATH = (
+#     Path(__file__).resolve().parents[1]
+#     / "load_records"
+#     / "only_run_load_history"
+# )
+
+# TEST_CONFIG = {
+#     "model_path": "/workspace/models/Qwen3-30B-A3B",
+#     "batch_size": 1024,
+#     "max_length": 256,
+#     "max_new_tokens": 256,
+#     "world_size": 2,
+#     "utilization": 0.85,
+# }
+
 LOAD_HISTORY_PATH = (
     Path(__file__).resolve().parents[1]
     / "load_records"
-    / "only_run_load_history"
+    / "only_run_235b_w8a8"
 )
-
 TEST_CONFIG = {
-    "model_path": "/workspace/models/Qwen3-30B-A3B",
-    "batch_size": 256,
+    "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
+    "batch_size": 1024,
     "max_length": 256,
     "max_new_tokens": 256,
-    "world_size": 2,
+    "world_size": 8,
     "utilization": 0.85,
 }
 
 RUNTIME_CONFIG = RuntimeConfig(
-    runtime_mode="offload",
+    runtime_mode="balance",
     interval=24,
-    num_buffers=2,
-    num_hot_experts=60,
+    # num_buffers=2,
+    # num_hot_experts=60,
+    num_redundant_experts=4,
+    num_experts_per_update=1,
     cpu_pin_memory=True,
     runtime_layer_ids=[],
     load_history_path=str(LOAD_HISTORY_PATH),
-    enable_history_mapping=True,
+    enable_history_mapping=False,
 )
 
 def load_contents_from_jsonl(jsonl_path):
@@ -53,7 +69,7 @@ def load_contents_from_jsonl(jsonl_path):
 def build_prompts(batch_size: int, max_length: int) -> list[str]:
     jsonl_path = '/workspace/Huawei/datasets/computer_en_26k.jsonl'
     combined_list = load_contents_from_jsonl(jsonl_path)
-    batch_user_inputs = combined_list[:TEST_CONFIG["batch_size"]]
+    batch_user_inputs = combined_list[:+TEST_CONFIG["batch_size"]]
     batch_user_inputs = [text[:TEST_CONFIG["max_length"]] for text in batch_user_inputs]
     return batch_user_inputs
 
@@ -96,8 +112,8 @@ if __name__ == "__main__":
         trust_remote_code=True,
         gpu_memory_utilization=TEST_CONFIG["utilization"],
         max_model_len=TEST_CONFIG["max_length"] + TEST_CONFIG["max_new_tokens"],
-        dtype="bfloat16",
-        # quantization='ascend',
+        # dtype="bfloat16",
+        quantization='ascend',
         enforce_eager=True,
         worker_extension_cls="src.utils.RuntimeWorkerExtension",
     )
