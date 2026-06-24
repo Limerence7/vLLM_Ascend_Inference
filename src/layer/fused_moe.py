@@ -263,7 +263,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
             or ascend_config.expert_map_record_path)
         if self.runtime_config.runtime_mode == "balance":
             self.dynamic_eplb = False
-            if hasattr(self.quant_method, "disable_native_dynamic_eplb"):
+            if self.uses_w8a8:
                 self.quant_method.disable_native_dynamic_eplb()
         self.expert_map_path = ascend_config.expert_map_path
         self.global_redundant_expert_num = ascend_config.init_redundancy_expert

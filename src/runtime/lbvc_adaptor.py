@@ -1,5 +1,3 @@
-from dataclasses import dataclass
-
 import torch
 import torch.distributed as dist
 
@@ -9,19 +7,8 @@ from ..runtime_config import RuntimeConfig
 from .memory_manager import ExpertMemoryManager
 
 
-@dataclass(frozen=True)
-class TokenSplitPlan:
-    enabled: bool = False
-    expert_map: torch.Tensor | None = None
-
-
 class LBVCAdaptor:
-    """Load-balance-via-CPU adaptor.
-
-    Initial implementation keeps the native local expert path and exposes the
-    scheduling surface used by the runtime layer. Redundant expert replacement
-    can be added here without touching offload execution.
-    """
+    """Load-balance-via-CPU adaptor."""
 
     def __init__(self, config: RuntimeConfig):
         self.config = config
@@ -37,7 +24,6 @@ class LBVCAdaptor:
             HistoryExpertMap(config.load_history_path)
             if config.enable_history_mapping else None)
         self._steps: dict[int, int] = {}
-        self.local_slots: dict[int, list[int]] = {}
         self.redundant_slots: dict[int, list[int]] = {}
         self.peer_expert_ids: dict[int, list[int]] = {}
         self.layers: dict[int, object] = {}
@@ -48,7 +34,6 @@ class LBVCAdaptor:
         redundant_count = int(self.config.num_redundant_experts)
         peer_experts = self._peer_experts(layer)
         self.layers[layer_id] = layer
-        self.local_slots[layer_id] = list(range(local_count))
         self.redundant_slots[layer_id] = list(
             range(local_count, local_count + redundant_count))
         self.peer_expert_ids[layer_id] = self._redundant_experts_from_map(
@@ -82,8 +67,7 @@ class LBVCAdaptor:
             group_list_type,
         )
         if self._should_update(layer):
-            self._update_redundant_experts(layer, group_list_type,
-                                           expert_tokens)
+            self._update_redundant_experts(layer)
 
     def save_load_history(self) -> None:
         self.profiler.save()
@@ -98,10 +82,6 @@ class LBVCAdaptor:
         step = self._steps.get(layer_id, 0) + 1
         self._steps[layer_id] = step
         return step % self.config.scheduler_interval == 0
-
-    def token_split_plan(self, layer, expert_tokens: torch.Tensor | None
-                         ) -> TokenSplitPlan:
-        return TokenSplitPlan(False)
 
     def initial_expert_maps(
         self,
@@ -145,20 +125,18 @@ class LBVCAdaptor:
 
         return local_slots, all_maps[ep_rank], log2phy[ep_rank]
 
-    def _update_redundant_experts(self, layer, group_list_type: int,
-                                  expert_tokens: torch.Tensor) -> None:
+    def _update_redundant_experts(self, layer) -> None:
         layer_id = int(layer.moe_instance_id)
         redundant_slots = self.redundant_slots.get(layer_id, [])
         peer_experts = self._peer_experts(layer)
+        if not peer_experts:
+            return
         if not redundant_slots:
             return
 
-        local_load = self._local_load(group_list_type, expert_tokens)
-        pair_load = self._pair_load(layer, local_load)
         peer_counts = self._global_expert_counts(layer)
-        if not peer_experts:
-            return
-        if pair_load is None:
+        if peer_counts is None or not self._pair_is_imbalanced(
+                layer, peer_counts):
             return
 
         candidates = self._ranked_new_peer_experts(
@@ -227,28 +205,6 @@ class LBVCAdaptor:
         physical_slot += owner_slot
         layer.log2phy[int(expert_id)] = physical_slot
 
-    def _local_load(self, group_list_type: int,
-                    expert_tokens: torch.Tensor) -> int:
-        counts = self._to_counts(expert_tokens, group_list_type)
-        return int(counts.sum().item())
-
-    def _pair_load(self, layer, local_load: int) -> tuple[int, int] | None:
-        peer_rank = self._peer_rank(int(layer.ep_rank), int(layer.ep_size))
-        if not dist.is_available() or not dist.is_initialized():
-            return None
-
-        loads = torch.zeros(int(layer.ep_size),
-                            dtype=torch.long,
-                            device=layer.w13_weight.device)
-        own = torch.tensor([local_load],
-                           dtype=torch.long,
-                           device=layer.w13_weight.device)
-        dist.all_gather_into_tensor(
-            loads, own, group=layer.moe_config.ep_group.device_group)
-        if peer_rank is None:
-            return None
-        return int(loads[int(layer.ep_rank)].item()), int(loads[peer_rank].item())
-
     def _global_expert_counts(self, layer) -> torch.Tensor | None:
         counts = self.profiler.get_layer_load(int(layer.moe_instance_id))
         if counts.numel() < int(layer.logical_num_experts):
@@ -262,6 +218,26 @@ class LBVCAdaptor:
         dist.all_reduce(device_counts,
                         group=layer.moe_config.ep_group.device_group)
         return device_counts.cpu()[:int(layer.logical_num_experts)]
+
+    def _pair_is_imbalanced(self, layer, counts: torch.Tensor) -> bool:
+        peer_rank = self._peer_rank(int(layer.ep_rank), int(layer.ep_size))
+        if peer_rank is None:
+            return False
+
+        experts_per_rank = int(layer.logical_num_experts) // int(layer.ep_size)
+        local_load = self._rank_load(counts, int(layer.ep_rank),
+                                     experts_per_rank)
+        peer_load = self._rank_load(counts, peer_rank, experts_per_rank)
+        heavier_load = max(local_load, peer_load, 1)
+        imbalance = abs(local_load - peer_load) / heavier_load
+        return imbalance >= float(self.config.imbalance_threshold)
+
+    @staticmethod
+    def _rank_load(counts: torch.Tensor, rank: int,
+                   experts_per_rank: int) -> int:
+        start = rank * experts_per_rank
+        end = start + experts_per_rank
+        return int(counts[start:end].sum().item())
 
     @staticmethod
     def _ranked_new_peer_experts(peer_experts: list[int],
@@ -282,16 +258,6 @@ class LBVCAdaptor:
             return available[0]
         loads = [int(counts[expert_id].item()) for expert_id in current]
         return min(available, key=loads.__getitem__)
-
-    @staticmethod
-    def _to_counts(expert_tokens: torch.Tensor,
-                   group_list_type: int) -> torch.Tensor:
-        if group_list_type == 1:
-            return expert_tokens.detach().to(device="cpu", dtype=torch.long)
-        expert_tokens = expert_tokens.detach().to(device="cpu",
-                                                  dtype=torch.long)
-        return torch.cat([expert_tokens[:1],
-                          expert_tokens[1:] - expert_tokens[:-1]])
 
     @staticmethod
     def _build_log2phy(all_maps: torch.Tensor, num_experts: int,

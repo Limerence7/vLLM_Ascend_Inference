@@ -349,16 +349,19 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                        shared_experts, apply_router_weight_on_input,
                        dynamic_eplb, mc2_mask, pertoken_scale):
         context = get_forward_context()
-        w2_scale = (experts.w2_weight_scale_fp32
-                    if context.moe_comm_type == MoECommType.FUSED_MC2
-                    and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2 else
-                    experts.w2_weight_scale)
-        w1 = getattr(experts, "w13_weight_list", [experts.w13_weight])
-        w1_scale = getattr(experts, "w13_weight_scale_fp32_list",
-                           [experts.w13_weight_scale_fp32])
-        w2 = getattr(experts, "w2_weight_list", [experts.w2_weight])
-        w2_scale = getattr(experts, "w2_weight_scale_list", [w2_scale])
-        local_num_experts = int(experts.w13_weight.shape[0])
+        w1 = self._tensor_list(experts, "w13_weight_list", "w13_weight")
+        w1_scale = self._tensor_list(
+            experts, "w13_weight_scale_fp32_list", "w13_weight_scale_fp32")
+        w2 = self._tensor_list(experts, "w2_weight_list", "w2_weight")
+        w2_scale = getattr(experts, "w2_weight_scale_list", None)
+        if w2_scale is None:
+            w2_scale_tensor = (
+                experts.w2_weight_scale_fp32
+                if context.moe_comm_type == MoECommType.FUSED_MC2
+                and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2 else
+                experts.w2_weight_scale)
+            w2_scale = [w2_scale_tensor]
+        local_num_experts = len(w1)
         eplb_kwargs = {}
         if log2phy is not None:
             eplb_kwargs = {
@@ -382,6 +385,13 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                 dynamic_eplb=dynamic_eplb,
                 mc2_mask=mc2_mask,
                 **eplb_kwargs)
+
+    @staticmethod
+    def _tensor_list(experts, list_name: str, tensor_name: str) -> list:
+        tensor_list = getattr(experts, list_name, None)
+        if tensor_list is not None:
+            return tensor_list
+        return [getattr(experts, tensor_name)]
 
     @staticmethod
     def _prepare_balance_weight_views(layer) -> None:
