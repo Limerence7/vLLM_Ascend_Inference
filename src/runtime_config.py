@@ -29,12 +29,8 @@ class RuntimeConfig:
             f"{self.runtime_mode} is not supported for runtime plugin.")
         assert self.interval > 0, 'interval must be a positive integer.'
         assert self.num_hot_experts >= 0, 'num_hot_experts must be non-negative.'
-        if self.runtime_mode == "offload":
-            assert self.num_buffers == 2, (
-                'offload mode currently requires num_buffers to be 2.')
-        else:
-            assert self.num_buffers > 0, (
-                'num_buffers must be a positive integer.')
+        assert self.num_buffers > 0, (
+            'num_buffers must be a positive integer.')
         assert self.num_redundant_experts >= 0, (
             'num_redundant_experts must be non-negative.')
         assert self.scheduler_interval > 0, (

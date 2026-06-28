@@ -24,9 +24,9 @@ class HistoryExpertMap:
 
     def expert_map_for_layer(self, layer) -> torch.Tensor | None:
         plan = self._plan_for_layer(layer)
-        if plan is None or int(layer.ep_rank) >= len(plan.expert_maps):
+        if plan is None:
             return None
-        return torch.tensor(plan.expert_maps[int(layer.ep_rank)],
+        return torch.tensor(plan.expert_maps[layer.ep_rank],
                             dtype=torch.int32)
 
     def global_load_for_layer(self, layer) -> torch.Tensor | None:
@@ -36,7 +36,7 @@ class HistoryExpertMap:
         return torch.tensor(plan.global_load, dtype=torch.long)
 
     def _plan_for_layer(self, layer) -> HistoryLayerPlan | None:
-        layer_id = int(layer.moe_instance_id)
+        layer_id = layer.moe_instance_id
         if layer_id not in self._plans:
             self._plans[layer_id] = self._broadcast_plan(layer)
         return self._plans[layer_id]
@@ -59,9 +59,9 @@ class HistoryExpertMap:
         num_experts = int(
             getattr(layer, "logical_num_experts", layer.global_num_experts))
         global_load = self._read_global_load(
-            layer_id=int(layer.moe_instance_id),
+            layer_id=layer.moe_instance_id,
             num_experts=num_experts,
-            num_ranks=int(layer.ep_size),
+            num_ranks=layer.ep_size,
         )
         if global_load is None:
             return None

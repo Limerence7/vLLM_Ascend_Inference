@@ -1,5 +1,4 @@
 import os.path
-from types import SimpleNamespace
 from typing import Callable
 
 import torch
@@ -18,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
     maybe_roundup_hidden_size)
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import determine_default_log2phy_map
 from vllm_ascend.eplb.utils import moe_load_async_stream
@@ -214,7 +214,6 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.full_expert_map = None
         self.full_local_num_experts = 0
         self.resident_local_num_experts = 0
-        self._global_ids_by_local_expert: list[list[int]] = []
         self._resident_maps_by_device: dict[torch.device, torch.Tensor] = {}
         self.log2phy = None
 
@@ -341,8 +340,6 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.full_local_num_experts = int(
             torch.sum(self.full_expert_map != -1).item()
             if self.full_expert_map is not None else self.global_num_experts)
-        self._global_ids_by_local_expert = (
-            self._build_global_ids_by_local_expert())
         self.resident_local_num_experts = self._resident_local_num_experts()
         self.expert_placement = self._init_expert_placement()
         self._expert_map = self._build_resident_expert_map()
@@ -355,6 +352,15 @@ class RuntimeAscendFusedMoE(FusedMoE):
                 " %s.", self.ep_rank, self.ep_size, self.full_local_num_experts,
                 self.global_num_experts,
                 get_compressed_expert_map(self.full_expert_map))
+            if self.runtime_config.runtime_mode == "balance":
+                logger.info(
+                    "[Runtime Balance][EP Rank %s/%s] Layer %s uses %s "
+                    "redundant experts per rank. Local/global experts: "
+                    "%s/%s. Global redundant experts: %s.",
+                    self.ep_rank, self.ep_size, self.moe_instance_id,
+                    self.runtime_config.num_redundant_experts,
+                    self.full_local_num_experts, self.global_num_experts,
+                    self.global_redundant_expert_num)
         if self.dynamic_eplb:
             self.moe_load = torch.zeros(self.resident_local_num_experts,
                                         dtype=torch.int64).npu()
@@ -469,26 +475,6 @@ class RuntimeAscendFusedMoE(FusedMoE):
         hot_ids = local_ids.masked_fill(~hot_mask, 0)
         return hot_ids.to(topk_ids.dtype), hot_mask
 
-    def local_expert_view(self):
-        if self.resident_local_num_experts == self.full_local_num_experts:
-            return self
-
-        view = SimpleNamespace()
-        for name in (
-            "w13_weight",
-            "w2_weight",
-            "w13_weight_scale",
-            "w13_weight_offset",
-            "w2_weight_scale",
-            "w2_weight_offset",
-            "w13_weight_scale_fp32",
-            "w2_weight_scale_fp32",
-        ):
-            if hasattr(self, name):
-                tensor = getattr(self, name)
-                setattr(view, name, tensor[:self.full_local_num_experts])
-        return view
-
     def _get_quant_type(self) -> QuantType:
         method = getattr(self.quant_method, "quant_method", None)
         if method is None:
@@ -499,50 +485,6 @@ class RuntimeAscendFusedMoE(FusedMoE):
         if isinstance(method, AscendW4A8DynamicFusedMoEMethod):
             return QuantType.W4A8
         return QuantType.NONE
-
-    def apply_expert_placement(self, placement, swaps=None) -> None:
-        self.expert_placement = placement
-        if swaps:
-            self._apply_expert_swaps(swaps)
-            return
-
-        self._expert_map = self._build_resident_expert_map()
-        self._resident_maps_by_device.clear()
-
-    def _apply_expert_swaps(self, swaps) -> None:
-        if self._expert_map is None:
-            self._expert_map = self._build_resident_expert_map()
-            self._resident_maps_by_device.clear()
-            return
-
-        for swap in swaps:
-            for global_id in self._global_ids_for_local_expert(swap.swap_out):
-                self._set_resident_map_entry(global_id, -1)
-            for global_id in self._global_ids_for_local_expert(swap.swap_in):
-                self._set_resident_map_entry(global_id, swap.resident_slot)
-
-    def _set_resident_map_entry(self, global_expert_id: int,
-                                resident_slot: int) -> None:
-        self._expert_map[global_expert_id] = resident_slot
-        for device_map in self._resident_maps_by_device.values():
-            device_map[global_expert_id] = resident_slot
-
-    def _global_ids_for_local_expert(self, local_expert_id: int) -> list[int]:
-        return self._global_ids_by_local_expert[local_expert_id]
-
-    def _build_global_ids_by_local_expert(self) -> list[list[int]]:
-        if self.full_expert_map is None:
-            return [[expert_id]
-                    for expert_id in range(int(self.global_num_experts))]
-
-        global_ids_by_local = [
-            [] for _ in range(int(self.full_local_num_experts))
-        ]
-        full_map = self.full_expert_map.detach().cpu()
-        for global_id, local_id in enumerate(full_map.tolist()):
-            if local_id >= 0:
-                global_ids_by_local[int(local_id)].append(int(global_id))
-        return global_ids_by_local
 
     def get_log2phy_map(self):
         return self.log2phy
@@ -607,8 +549,22 @@ class RuntimeAscendFusedMoE(FusedMoE):
 
         forward_context = get_forward_context()
         enable_force_load_balance = forward_context.in_profile_run
-
         moe_comm_method = forward_context.moe_comm_method
+        if self.runtime_config.runtime_mode == "balance":
+            assert self.lbvc_adaptor is not None
+            self.lbvc_adaptor.before_forward(self)
+            moe_comm_type = getattr(forward_context, "moe_comm_type", None)
+            uses_allgather = (
+                moe_comm_type == MoECommType.ALLGATHER
+                or moe_comm_method.__class__.__name__
+                == "RuntimeAllGatherCommImpl")
+            if not uses_allgather:
+                raise NotImplementedError(
+                    "runtime_mode=balance currently supports only AllGather "
+                    "MoE communication. Select AllGather or add a matching "
+                    "runtime all2all dispatcher that honors expert_map/log2phy."
+                )
+
         hidden_states, router_logits, mc2_mask, context_metadata = (
             moe_comm_method.prepare(
             hidden_states=hidden_states,

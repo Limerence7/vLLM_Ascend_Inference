@@ -13,13 +13,10 @@ class CpuExpertWeights:
         "w2_weight_offset",
     )
     TENSOR_LISTS = {
-        "w13_weight": ("w13_weight_list", "w13_weight"),
-        "w2_weight": ("w2_weight_list", "w2_weight"),
-        "w13_weight_scale": (
-            "w13_weight_scale_fp32_list",
-            "w13_weight_scale_fp32",
-        ),
-        "w2_weight_scale": ("w2_weight_scale_list", "w2_weight_scale"),
+        "w13_weight": "w13_weight_list",
+        "w2_weight": "w2_weight_list",
+        "w13_weight_scale": "w13_weight_scale_fp32_list",
+        "w2_weight_scale": "w2_weight_scale_list",
     }
 
     def __init__(self, layer, expert_ids: list[int], cpu_pin_memory: bool):
@@ -85,31 +82,31 @@ class CpuExpertWeights:
         }
 
     def copy_to_module(self, expert_ids: list[int], module,
-                       target_slots: list[int] | None = None) -> None:
-        
+                       target_slots: list[int]) -> None:
         for expert_id, target_slot in zip(expert_ids, target_slots):
             source_slot = self.expert_id_to_slot[expert_id]
             for name, tensor in self.tensors.items():
-                target = getattr(module, name)
-                target[target_slot].copy_(tensor[source_slot],
-                                          non_blocking=True)
+                self._copy_tensor(module, name, target_slot,
+                                  tensor[source_slot])
                 if name in ("w13_weight_scale", "w2_weight_scale"):
                     fp32_target = getattr(module, f"{name}_fp32", None)
                     if fp32_target is not None:
                         fp32_target[target_slot].copy_(
                             tensor[source_slot], non_blocking=True)
-                self._sync_tensor_list(module, name, target_slot)
 
     @staticmethod
-    def _sync_tensor_list(module, name: str, target_slot: int) -> None:
-        list_name, source_name = CpuExpertWeights.TENSOR_LISTS.get(
-            name, (None, None))
+    def _copy_tensor(module, name: str, target_slot: int,
+                     source: torch.Tensor) -> None:
+        target = getattr(module, name, None)
+        if target is not None:
+            target[target_slot].copy_(source, non_blocking=True)
+            return
+
+        list_name = CpuExpertWeights.TENSOR_LISTS.get(name)
         if list_name is None or not hasattr(module, list_name):
             return
-        getattr(module, list_name)[target_slot].copy_(
-            getattr(module, source_name)[target_slot],
-            non_blocking=True,
-        )
+        getattr(module, list_name)[target_slot].copy_(source,
+                                                      non_blocking=True)
 
     @staticmethod
     def _empty_cpu_like(
@@ -165,7 +162,7 @@ class ExpertMemoryManager:
         layer_id: int,
         expert_ids: list[int],
         module,
-        target_slots: list[int] | None = None,
+        target_slots: list[int],
     ) -> None:
         self.layers[layer_id].copy_to_module(expert_ids, module,
                                              target_slots)

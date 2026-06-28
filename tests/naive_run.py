@@ -20,18 +20,18 @@ Inference_Config = {
     "Qwen3-235B-A22B": {
         "model_path": "/workspace/models/Qwen3-235B-A22B",
         "batch_size": 512,
-        "max_length": 64,
-        "max_new_tokens": 64,
+        "max_length": 1024,
+        "max_new_tokens": 32,
         "world_size": 8,
         "utilization": 0.98,
     },
     "Qwen3-235B-A22B-W8A8": {
         "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
-        "batch_size": 1024,
-        "max_length": 256,
-        "max_new_tokens": 256,
+        "batch_size": 512,
+        "max_length": 2560,
+        "max_new_tokens": 2560,
         "world_size": 8,
-        "utilization": 0.85,
+        "utilization": 0.80,
     },
 }
 
@@ -80,7 +80,7 @@ if __name__ == "__main__":
 
     jsonl_path = '/workspace/Huawei/datasets/computer_en_26k.jsonl'
     combined_list = load_contents_from_jsonl(jsonl_path)
-    batch_user_inputs = combined_list[:+current_config["batch_size"]]
+    batch_user_inputs = combined_list[:current_config["batch_size"]]
     batch_user_inputs = [text[:current_config["max_length"]] for text in batch_user_inputs]
 
     prompts = []

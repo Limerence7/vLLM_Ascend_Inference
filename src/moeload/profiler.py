@@ -17,11 +17,13 @@ class ExpertLoadProfiler:
                  path: str | None = None,
                  metadata: dict[str, Any] | None = None):
         self.path = path
+        self.rank = dist.get_rank() if dist.is_available(
+        ) and dist.is_initialized() else 0
         self._layers: dict[int, int] = {}
         self._counts: dict[int, torch.Tensor] = {}
         self._local_to_global: dict[int, torch.Tensor] = {}
         self._metadata = dict(metadata or {})
-        self._metadata["rank"] = self._rank()
+        self._metadata["rank"] = self.rank
 
     @property
     def output_path(self) -> str | None:
@@ -29,8 +31,8 @@ class ExpertLoadProfiler:
         return None if path is None else str(path)
 
     def register_layer(self, layer) -> None:
-        layer_id = int(layer.moe_instance_id)
-        num_experts = int(layer.global_num_experts)
+        layer_id = layer.moe_instance_id
+        num_experts = layer.global_num_experts
         self._layers[layer_id] = num_experts
         self._local_to_global[layer_id] = self._build_local_to_global(layer)
         self._counts.setdefault(
@@ -39,7 +41,8 @@ class ExpertLoadProfiler:
         )
 
     def update_layer_map(self, layer) -> None:
-        self._local_to_global[int(layer.moe_instance_id)] = (
+        layer_id = layer.moe_instance_id
+        self._local_to_global[layer_id] = (
             self._build_local_to_global(layer))
 
     def record_expert_tokens(
@@ -52,7 +55,7 @@ class ExpertLoadProfiler:
             layer_id,
             expert_tokens,
             group_list_type,
-            self._local_to_global.get(layer_id),
+            self._local_to_global[layer_id],
         )
 
     def record_slot_tokens(
@@ -60,9 +63,9 @@ class ExpertLoadProfiler:
         layer_id: int,
         expert_tokens: torch.Tensor,
         group_list_type: int,
-        slot_to_global: torch.Tensor | None,
+        slot_to_global: torch.Tensor,
     ) -> None:
-        if layer_id not in self._layers or expert_tokens.numel() == 0:
+        if expert_tokens.numel() == 0:
             return
 
         num_experts = self._layers[layer_id]
@@ -70,8 +73,6 @@ class ExpertLoadProfiler:
         local_counts = local_counts.to(device="cpu", dtype=torch.long)
         global_counts = torch.zeros(num_experts, dtype=torch.long, device="cpu")
 
-        if slot_to_global is None:
-            return
         slot_to_global = slot_to_global.to(device="cpu", dtype=torch.long)
         size = min(local_counts.numel(), slot_to_global.numel())
         if size == 0:
@@ -130,15 +131,9 @@ class ExpertLoadProfiler:
                                      dtype=torch.long,
                                      device="cpu")
         for global_id, local_id in enumerate(full_map.tolist()):
-            if local_id >= 0 and local_id < local_num_experts:
+            if local_id >= 0:
                 local_to_global[int(local_id)] = int(global_id)
         return local_to_global
-
-    @staticmethod
-    def _rank() -> int:
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank()
-        return 0
 
     @classmethod
     def _rank_file_path(cls, path: str | None) -> Path | None:
@@ -146,5 +141,7 @@ class ExpertLoadProfiler:
             return None
 
         directory = Path(path)
-        rank_name = f"{directory.name}_rank{cls._rank()}"
+        rank = dist.get_rank() if dist.is_available(
+        ) and dist.is_initialized() else 0
+        rank_name = f"{directory.name}_rank{rank}"
         return directory / f"{rank_name}.json"

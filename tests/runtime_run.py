@@ -28,23 +28,37 @@ LOAD_HISTORY_PATH = (
 )
 TEST_CONFIG = {
     "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
-    "batch_size": 1024,
-    "max_length": 256,
-    "max_new_tokens": 256,
+    "batch_size": 512,
+    "max_length": 2560,
+    "max_new_tokens": 2560,
     "world_size": 8,
-    "utilization": 0.85,
+    "utilization": 0.80,
 }
 
+# LOAD_HISTORY_PATH = (
+#     Path(__file__).resolve().parents[1]
+#     / "load_records"
+#     / "only_run_235b"
+# )
+# TEST_CONFIG = {
+#     "model_path": "/workspace/models/Qwen3-235B-A22B",
+#     "batch_size": 512,
+#     "max_length": 1024,
+#     "max_new_tokens": 32,
+#     "world_size": 8,
+#     "utilization": 0.98,
+# }
+
 RUNTIME_CONFIG = RuntimeConfig(
-    runtime_mode="balance",
-    interval=24,
-    # num_buffers=2,
-    # num_hot_experts=60,
-    num_redundant_experts=4,
-    num_experts_per_update=1,
+    runtime_mode="offload",
+    interval=12,
+    num_buffers=2,
+    num_hot_experts=0,
+    # num_redundant_experts=2,
+    # num_experts_per_update=1,
     cpu_pin_memory=True,
     runtime_layer_ids=[],
-    load_history_path=str(LOAD_HISTORY_PATH),
+    # load_history_path=str(LOAD_HISTORY_PATH),
     enable_history_mapping=False,
 )
 
@@ -69,7 +83,7 @@ def load_contents_from_jsonl(jsonl_path):
 def build_prompts(batch_size: int, max_length: int) -> list[str]:
     jsonl_path = '/workspace/Huawei/datasets/computer_en_26k.jsonl'
     combined_list = load_contents_from_jsonl(jsonl_path)
-    batch_user_inputs = combined_list[:+TEST_CONFIG["batch_size"]]
+    batch_user_inputs = combined_list[:TEST_CONFIG["batch_size"]]
     batch_user_inputs = [text[:TEST_CONFIG["max_length"]] for text in batch_user_inputs]
     return batch_user_inputs
 

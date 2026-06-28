@@ -58,6 +58,18 @@ class PreparedColdExperts(NamedTuple):
     mask: torch.Tensor | None
 
 
+def _layer_device(layer) -> torch.device:
+    weight = getattr(layer, "w13_weight", None)
+    if weight is not None:
+        return weight.device
+
+    weight_list = getattr(layer, "w13_weight_list", None)
+    if weight_list:
+        return weight_list[0].device
+
+    return next(layer.parameters()).device
+
+
 class ExoExecutor(nn.Module):
     """Runtime executor for CPU-to-NPU expert offload."""
 
@@ -94,28 +106,18 @@ class ExoExecutor(nn.Module):
         return self.config.offload_layer_wise
 
     def should_manage_layer(self, layer) -> bool:
-        return int(layer.moe_instance_id) in set(self.config.runtime_layer_ids)
+        return layer.moe_instance_id in set(self.config.runtime_layer_ids)
 
     def should_store_cpu_expert(self, layer, local_expert_id: int) -> bool:
-        if self.config.runtime_mode != "offload":
-            return False
         if not self.should_manage_layer(layer) or local_expert_id < 0:
             return False
         return self.offload_full_layer or local_expert_id in self.placements[
             layer.moe_instance_id].cold_slots
 
-    def should_offload_expert(self, layer, local_expert_id: int) -> bool:
-        return self.should_store_cpu_expert(layer, local_expert_id)
-
     def history_expert_map_for_layer(self, layer) -> torch.Tensor | None:
         if self.history_mapping is None:
             return None
         return self.history_mapping.expert_map_for_layer(layer)
-
-    def global_load_for_layer(self, layer) -> torch.Tensor | None:
-        if self.history_mapping is None:
-            return None
-        return self.history_mapping.global_load_for_layer(layer)
 
     def init_layer_placement(self, layer) -> ExpertPlacement:
         num_resident = self._num_resident_experts(layer)
@@ -161,7 +163,7 @@ class ExoExecutor(nn.Module):
         if not self.should_store_cpu_expert(layer, local_expert_id):
             return False
 
-        loaded = self.memory_manager.load_weight_shard(
+        return self.memory_manager.load_weight_shard(
             layer_id=layer.moe_instance_id,
             param_name=param_name,
             local_expert_id=local_expert_id,
@@ -169,13 +171,13 @@ class ExoExecutor(nn.Module):
             loaded_weight=loaded_weight,
             tp_rank=layer.tp_rank,
         )
-        return loaded and self.should_offload_expert(layer, local_expert_id)
 
     def process_layer_after_loading(self, layer, quant_method) -> None:
         if self.config.runtime_mode != "offload":
             return
         self.memory_manager.process_layer_after_loading(layer.moe_instance_id,
                                                         quant_method)
+        self._init_cold_buffers()
         torch.npu.empty_cache()
 
     def prepare_cold_experts(self, layer,
@@ -221,7 +223,7 @@ class ExoExecutor(nn.Module):
         layer,
         group_list_type: int,
         expert_tokens: torch.Tensor,
-        slot_to_global: torch.Tensor | None,
+        slot_to_global: torch.Tensor,
     ) -> None:
         self.profiler.record_slot_tokens(
             int(layer.moe_instance_id),
@@ -230,11 +232,11 @@ class ExoExecutor(nn.Module):
             slot_to_global,
         )
 
-    def resident_slot_to_global(self, layer) -> torch.Tensor | None:
-        return self._resident_slot_to_global.get(int(layer.moe_instance_id))
+    def resident_slot_to_global(self, layer) -> torch.Tensor:
+        return self._resident_slot_to_global[int(layer.moe_instance_id)]
 
-    def cold_slot_to_global(self, layer) -> torch.Tensor | None:
-        return self._cold_slot_to_global.get(int(layer.moe_instance_id))
+    def cold_slot_to_global(self, layer) -> torch.Tensor:
+        return self._cold_slot_to_global[int(layer.moe_instance_id)]
 
     def save_load_history(self) -> None:
         self.profiler.save()
@@ -261,7 +263,7 @@ class ExoExecutor(nn.Module):
                 ColdExperts(
                     templates=template_weights,
                     num_experts=max_cold_experts,
-                    device=self.layers[template_id].w13_weight.device,
+                    device=_layer_device(self.layers[template_id]),
                     use_w8a8=self.uses_w8a8,
                 ))
 
