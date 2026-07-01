@@ -10,41 +10,71 @@ class RuntimeConfig:
     runtime_layer_ids: list[int] = field(default_factory=list)
     interval: int = 1
     cpu_pin_memory: bool = True
+    num_runtime_experts: int = 0
 
     load_history_path: str | None = None
     enable_history_mapping: bool = False
-
-    num_hot_experts: int = 0
-    num_buffers: int = 2
-
-    pair_topology: list[tuple[int, int]] | None = None
-    num_redundant_experts: int = 0
+    policy_interval: int = 16
     imbalance_threshold: float = 0.2
-    scheduler_interval: int = 16
+
+    num_buffers: int = 2
     num_experts_per_update: int = 1
+    global_balance: bool = True
+    share_all_cpu_experts: bool = True
+    shared_cpu_expert_dir: str = "/dev/shm/vllm_ascend_runtime"
+    shared_cpu_expert_name: str | None = None
 
     def validate(self) -> None:
         self.runtime_mode = self.runtime_mode.strip().lower()
         assert self.runtime_mode in RUNTIME_MODES, (
             f"{self.runtime_mode} is not supported for runtime plugin.")
         assert self.interval > 0, 'interval must be a positive integer.'
-        assert self.num_hot_experts >= 0, 'num_hot_experts must be non-negative.'
         assert self.num_buffers > 0, (
             'num_buffers must be a positive integer.')
-        assert self.num_redundant_experts >= 0, (
-            'num_redundant_experts must be non-negative.')
-        assert self.scheduler_interval > 0, (
-            'scheduler_interval must be a positive integer.')
+        assert self.policy_interval > 0, (
+            'policy_interval must be a positive integer.')
         assert self.num_experts_per_update > 0, (
             'num_experts_per_update must be a positive integer.')
+        if self.runtime_mode == "profile":
+            assert self.num_runtime_experts == 0, (
+                'profile mode must keep num_runtime_experts at 0.')
+        if self.runtime_mode == "offload":
+            assert self.num_runtime_experts <= 0, (
+                'offload mode expects num_runtime_experts <= 0.')
+        if self.runtime_mode == "balance":
+            self.global_balance = True
+            self.share_all_cpu_experts = True
 
     @property
-    def offload_layer_wise(self) -> bool:
-        return self.runtime_mode == "offload" and self.num_hot_experts == 0
+    def offload_count(self) -> int:
+        return (
+            abs(self.num_runtime_experts)
+            if self.uses_cold_buffer else 0)
+
+    @property
+    def redundant_count(self) -> int:
+        return (
+            self.num_runtime_experts
+            if self.runtime_mode == "balance" and self.num_runtime_experts > 0
+            else 0)
+
+    @property
+    def uses_runtime_core(self) -> bool:
+        return self.runtime_mode in ("offload", "balance")
+
+    @property
+    def uses_cold_buffer(self) -> bool:
+        return (
+            self.runtime_mode in ("offload", "balance")
+            and self.num_runtime_experts < 0)
+
+    @property
+    def stores_all_cpu_experts(self) -> bool:
+        return self.runtime_mode == "balance"
 
     @property
     def use_cpu_experts(self) -> bool:
-        return self.runtime_mode in ("offload", "balance")
+        return self.stores_all_cpu_experts or self.uses_cold_buffer
 
     def prepare_for_model(self, num_layers: int, num_experts: int) -> None:
         self.validate()
@@ -53,8 +83,16 @@ class RuntimeConfig:
             sorted(set(self.runtime_layer_ids))
             or list(range(0, num_layers, self.interval)))
 
-        if self.runtime_mode == "offload" and self.num_hot_experts >= num_experts:
+        if self.runtime_mode == "profile":
+            self.runtime_layer_ids = [
+                layer_id for layer_id in layer_ids
+                if 0 <= layer_id < num_layers
+            ]
+            return
+
+        if self.uses_cold_buffer and self.offload_count >= num_experts:
             layer_ids = []
+
         self.runtime_layer_ids = [
             layer_id for layer_id in layer_ids
             if 0 <= layer_id < num_layers

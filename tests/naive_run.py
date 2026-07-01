@@ -12,10 +12,10 @@ Inference_Config = {
     "Qwen3-30B-A3B": {
         "model_path": "/workspace/models/Qwen3-30B-A3B",
         "batch_size": 1024,
-        "max_length": 256,
-        "max_new_tokens": 256,
+        "max_length": 1024,
+        "max_new_tokens": 512,
         "world_size": 2,
-        "utilization": 0.85,
+        "utilization": 0.80,
     },
     "Qwen3-235B-A22B": {
         "model_path": "/workspace/models/Qwen3-235B-A22B",
@@ -35,7 +35,7 @@ Inference_Config = {
     },
 }
 
-current_config = Inference_Config["Qwen3-235B-A22B-W8A8"]
+current_config = Inference_Config["Qwen3-30B-A3B"]
 
 def load_contents_from_jsonl(jsonl_path):
     contents = []
@@ -50,7 +50,7 @@ def load_contents_from_jsonl(jsonl_path):
                 human = conver.get("human", "")
                 assistant = conver.get("assistant", "")
                 text += (human + assistant)
-            if len(text) >= 1024:
+            if len(text) >= 2048:
                 contents.append(text)
     # random.shuffle(contents)
     return contents
@@ -72,23 +72,31 @@ if __name__ == "__main__":
         trust_remote_code=True,
         gpu_memory_utilization=current_config["utilization"],
         max_model_len=current_config["max_length"] + current_config["max_new_tokens"],
-        # dtype="bfloat16",
-        quantization='ascend',
+        dtype="bfloat16",
+        # quantization='ascend',
         enforce_eager=True,
         
     )
 
-    jsonl_path = '/workspace/Huawei/datasets/computer_en_26k.jsonl'
+    tokenizer = llm.get_tokenizer()
+    jsonl_path = "/workspace/Huawei/datasets/computer_en_26k.jsonl"
     combined_list = load_contents_from_jsonl(jsonl_path)
     batch_user_inputs = combined_list[:current_config["batch_size"]]
-    batch_user_inputs = [text[:current_config["max_length"]] for text in batch_user_inputs]
+    encoded = tokenizer(
+        batch_user_inputs,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=current_config["max_length"],
+        padding=False,
+        return_attention_mask=False,
+    )
 
-    prompts = []
-    for prompt in batch_user_inputs:
-        chat_text = f"User: {prompt}\nAssistant:"
-        prompts.append(chat_text)
+    batch_user_inputs = tokenizer.batch_decode(
+        encoded["input_ids"],
+        skip_special_tokens=True,
+    )
 
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(batch_user_inputs, sampling_params)
 
     for output in outputs:
         prompt = output.prompt

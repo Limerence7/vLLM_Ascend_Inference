@@ -2,15 +2,14 @@ class RuntimeWorkerExtension:
     """Worker RPC methods for runtime utilities."""
 
     def save_load_history(self) -> dict[str, object]:
-        from .layer.fused_moe import RuntimeAscendFusedMoE
+        from .runtime.runtime_core import RuntimeCore
 
-        recorder = (RuntimeAscendFusedMoE.lbvc_adaptor
-                    or RuntimeAscendFusedMoE.executor
-                    or RuntimeAscendFusedMoE.load_profiler)
+        core = RuntimeCore
+        recorder = core._adaptor or core._executor or core._profiler
         if recorder is None:
             return {
                 "saved": False,
-                "reason": "runtime executor is not initialized",
+                "reason": "runtime core is not initialized",
             }
 
         if hasattr(recorder, "save_load_history"):

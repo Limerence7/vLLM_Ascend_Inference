@@ -6,34 +6,34 @@ from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
 
-# LOAD_HISTORY_PATH = (
-#     Path(__file__).resolve().parents[1]
-#     / "load_records"
-#     / "only_run_load_history"
-# )
-
-# TEST_CONFIG = {
-#     "model_path": "/workspace/models/Qwen3-30B-A3B",
-#     "batch_size": 1024,
-#     "max_length": 256,
-#     "max_new_tokens": 256,
-#     "world_size": 2,
-#     "utilization": 0.85,
-# }
-
 LOAD_HISTORY_PATH = (
     Path(__file__).resolve().parents[1]
     / "load_records"
-    / "only_run_235b_w8a8"
+    / "only_run_load_history"
 )
+
 TEST_CONFIG = {
-    "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
+    "model_path": "/workspace/models/Qwen3-30B-A3B",
     "batch_size": 1024,
-    "max_length": 2560,
-    "max_new_tokens": 2560,
-    "world_size": 8,
+    "max_length": 1024,
+    "max_new_tokens": 512,
+    "world_size": 2,
     "utilization": 0.80,
 }
+
+# LOAD_HISTORY_PATH = (
+#     Path(__file__).resolve().parents[1]
+#     / "load_records"
+#     / "only_run_235b_w8a8"
+# )
+# TEST_CONFIG = {
+#     "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
+#     "batch_size": 1024,
+#     "max_length": 2560,
+#     "max_new_tokens": 2560,
+#     "world_size": 8,
+#     "utilization": 0.80,
+# }
 
 # LOAD_HISTORY_PATH = (
 #     Path(__file__).resolve().parents[1]
@@ -51,15 +51,14 @@ TEST_CONFIG = {
 
 RUNTIME_CONFIG = RuntimeConfig(
     runtime_mode="offload",
-    interval=12,
+    interval=24,
     num_buffers=2,
-    num_hot_experts=0,
-    # num_redundant_experts=2,
-    # num_experts_per_update=1,
+    num_runtime_experts=0,
+    num_experts_per_update = 2,
     cpu_pin_memory=True,
     runtime_layer_ids=[],
-    # load_history_path=str(LOAD_HISTORY_PATH),
-    enable_history_mapping=False,
+    load_history_path=str(LOAD_HISTORY_PATH),
+    enable_history_mapping=True,
 )
 
 def load_contents_from_jsonl(jsonl_path):
@@ -75,16 +74,30 @@ def load_contents_from_jsonl(jsonl_path):
                 human = conver.get("human", "")
                 assistant = conver.get("assistant", "")
                 text += (human + assistant)
-            if len(text) >= 1024:
+            if len(text) >= 2048:
                 contents.append(text)
     return contents
 
 
-def build_prompts(batch_size: int, max_length: int) -> list[str]:
-    jsonl_path = '/workspace/Huawei/datasets/computer_en_26k.jsonl'
+def build_prompts(batch_size: int, max_length: int, tokenizer) -> list[str]:
+    jsonl_path = "/workspace/Huawei/datasets/computer_en_26k.jsonl"
     combined_list = load_contents_from_jsonl(jsonl_path)
-    batch_user_inputs = combined_list[:TEST_CONFIG["batch_size"]]
-    batch_user_inputs = [text[:TEST_CONFIG["max_length"]] for text in batch_user_inputs]
+    batch_user_inputs = combined_list[:batch_size]
+
+    encoded = tokenizer(
+        batch_user_inputs,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+        return_attention_mask=False,
+    )
+
+    batch_user_inputs = tokenizer.batch_decode(
+        encoded["input_ids"],
+        skip_special_tokens=True,
+    )
+
     return batch_user_inputs
 
 
@@ -126,14 +139,18 @@ if __name__ == "__main__":
         trust_remote_code=True,
         gpu_memory_utilization=TEST_CONFIG["utilization"],
         max_model_len=TEST_CONFIG["max_length"] + TEST_CONFIG["max_new_tokens"],
-        # dtype="bfloat16",
-        quantization='ascend',
+        dtype="bfloat16",
+        # quantization='ascend',
         enforce_eager=True,
         worker_extension_cls="src.utils.RuntimeWorkerExtension",
     )
 
     outputs = llm.generate(
-        build_prompts(TEST_CONFIG["batch_size"], TEST_CONFIG["max_length"]),
+        build_prompts(
+            TEST_CONFIG["batch_size"], 
+            TEST_CONFIG["max_length"],
+            llm.get_tokenizer(),
+        ),
         sampling_params,
     )
     save_load_history(llm)

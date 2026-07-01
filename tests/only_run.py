@@ -5,74 +5,55 @@ from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
 
-# LOAD_HISTORY_PATH = (
-#     Path(__file__).resolve().parents[1]
-#     / "load_records"
-#     / "only_run_load_history"
-# )
-
-# TEST_CONFIG = {
-#     "model_path": "/workspace/models/Qwen3-30B-A3B",
-#     "batch_size": 1,
-#     "max_length": 32,
-#     "max_new_tokens": 8,
-#     "max_num_batched_tokens": 64,
-#     "max_num_seqs": 1,
-#     "world_size": 2,
-#     "utilization": 0.85,
-# }
-
 LOAD_HISTORY_PATH = (
     Path(__file__).resolve().parents[1]
     / "load_records"
-    / "only_run_235b_w8a8"
+    / "only_run_load_history"
 )
+
 TEST_CONFIG = {
-    "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
+    "model_path": "/workspace/models/Qwen3-30B-A3B",
     "batch_size": 1,
     "max_length": 32,
     "max_new_tokens": 8,
     "max_num_batched_tokens": 64,
     "max_num_seqs": 1,
-    "world_size": 8,
-    "utilization": 0.80,
+    "world_size": 2,
+    "utilization": 0.85,
 }
 
+# LOAD_HISTORY_PATH = (
+#     Path(__file__).resolve().parents[1]
+#     / "load_records"
+#     / "only_run_235b_w8a8"
+# )
+# TEST_CONFIG = {
+#     "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
+#     "batch_size": 1,
+#     "max_length": 32,
+#     "max_new_tokens": 8,
+#     "max_num_batched_tokens": 64,
+#     "max_num_seqs": 1,
+#     "world_size": 8,
+#     "utilization": 0.80,
+# }
+
 RUNTIME_CONFIG = RuntimeConfig(
-    runtime_mode="offload",
+    runtime_mode="balance",
     interval=16,
     num_buffers=2,
-    num_hot_experts=0,
-    # num_redundant_experts=4,
-    # num_experts_per_update=1,
+    num_runtime_experts=0,
     cpu_pin_memory=True,
     runtime_layer_ids=[],
     load_history_path=str(LOAD_HISTORY_PATH),
     enable_history_mapping=False,
 )
 
-# TEST_CONFIG = {
-#     "model_path": "/workspace/models/Qwen3-235B-A22B",
-#     "batch_size": 32,
-#     "max_length": 32,
-#     "max_new_tokens": 4,
-#     "world_size": 8,
-#     "utilization": 0.98,
-# }
 
-# RUNTIME_CONFIG = RuntimeConfig(
-#     runtime_mode="offload",
-#     interval=16,
-#     num_buffers=2,
-#     num_hot_experts=8,
-#     cpu_pin_memory=True,
-#     runtime_layer_ids=[],
-# )
-
-
-def build_prompts(batch_size: int, max_length: int) -> list[str]:
+def build_prompts(batch_size: int, max_length: int, tokenizer) -> list[str]:
     prompt = "User: Explain what expert offloading is in one sentence.\nAssistant:"
-    prompt = prompt[:max_length]
+    token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    prompt = tokenizer.decode(token_ids[:max_length])
     return [prompt for _ in range(batch_size)]
 
 
@@ -116,14 +97,18 @@ if __name__ == "__main__":
         max_model_len=TEST_CONFIG["max_length"] + TEST_CONFIG["max_new_tokens"],
         max_num_batched_tokens=TEST_CONFIG["max_num_batched_tokens"],
         max_num_seqs=TEST_CONFIG["max_num_seqs"],
-        # dtype="bfloat16",
-        quantization='ascend',
+        dtype="bfloat16",
+        # quantization='ascend',
         enforce_eager=True,
         worker_extension_cls="src.utils.RuntimeWorkerExtension",
     )
 
     outputs = llm.generate(
-        build_prompts(TEST_CONFIG["batch_size"], TEST_CONFIG["max_length"]),
+        build_prompts(
+            TEST_CONFIG["batch_size"],
+            TEST_CONFIG["max_length"],
+            llm.get_tokenizer(),
+        ),
         sampling_params,
     )
     save_load_history(llm)

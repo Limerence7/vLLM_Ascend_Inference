@@ -21,6 +21,7 @@ class ExpertLoadProfiler:
         
         self._layers: dict[int, int] = {}
         self._counts: dict[int, torch.Tensor] = {}
+        self._last_load_snapshot: dict[int, torch.Tensor] = {}
         self._local_to_global: dict[int, torch.Tensor] = {}
         self._metadata = dict(metadata or {})
         self._metadata["rank"] = self.rank
@@ -41,6 +42,10 @@ class ExpertLoadProfiler:
         self._layers[layer_id] = num_experts
         self._local_to_global[layer_id] = self._build_local_to_global(layer)
         self._counts.setdefault(
+            layer_id,
+            torch.zeros(num_experts, dtype=torch.long, device="cpu"),
+        )
+        self._last_load_snapshot.setdefault(
             layer_id,
             torch.zeros(num_experts, dtype=torch.long, device="cpu"),
         )
@@ -88,6 +93,13 @@ class ExpertLoadProfiler:
 
     def get_layer_load(self, layer_id: int) -> torch.Tensor:
         return self._counts[layer_id].detach().cpu()
+
+    def get_layer_delta_load(self, layer_id: int) -> torch.Tensor:
+        current = self._counts[layer_id].detach().cpu()
+        previous = self._last_load_snapshot[layer_id]
+        delta = current - previous
+        self._last_load_snapshot[layer_id] = current.clone()
+        return delta
 
     def save(self) -> None:
         target_path = self._rank_file_path(self.path)
