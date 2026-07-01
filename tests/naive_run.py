@@ -28,8 +28,8 @@ Inference_Config = {
     "Qwen3-235B-A22B-W8A8": {
         "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
         "batch_size": 512,
-        "max_length": 2560,
-        "max_new_tokens": 2560,
+        "max_length": 32,
+        "max_new_tokens": 5120,
         "world_size": 8,
         "utilization": 0.80,
     },

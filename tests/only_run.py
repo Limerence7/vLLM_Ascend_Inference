@@ -35,19 +35,20 @@ TEST_CONFIG = {
     "max_num_batched_tokens": 64,
     "max_num_seqs": 1,
     "world_size": 8,
-    "utilization": 0.98,
+    "utilization": 0.80,
 }
 
 RUNTIME_CONFIG = RuntimeConfig(
-    runtime_mode="balance",
+    runtime_mode="offload",
     interval=16,
     num_buffers=2,
-    num_redundant_experts=4,
-    num_experts_per_update=1,
+    num_hot_experts=0,
+    # num_redundant_experts=4,
+    # num_experts_per_update=1,
     cpu_pin_memory=True,
     runtime_layer_ids=[],
     load_history_path=str(LOAD_HISTORY_PATH),
-    enable_history_mapping=True,
+    enable_history_mapping=False,
 )
 
 # TEST_CONFIG = {

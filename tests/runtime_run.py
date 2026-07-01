@@ -28,7 +28,7 @@ LOAD_HISTORY_PATH = (
 )
 TEST_CONFIG = {
     "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
-    "batch_size": 512,
+    "batch_size": 1024,
     "max_length": 2560,
     "max_new_tokens": 2560,
     "world_size": 8,

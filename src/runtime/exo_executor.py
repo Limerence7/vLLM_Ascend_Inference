@@ -22,34 +22,84 @@ class ColdExperts(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         for name, template in templates.items():
-            tensor = torch.empty((num_experts, *template.shape[1:]),
-                                 dtype=template.dtype,
-                                 device=device)
             if use_w8a8 and name in ("w13_weight", "w2_weight"):
-                tensor = torch_npu.npu_format_cast(
-                    tensor, ACL_FORMAT_FRACTAL_NZ)
-            self.register_parameter(
-                name, nn.Parameter(tensor, requires_grad=False))
-
-        if hasattr(self, "w13_weight_scale"):
-            self.w13_weight_scale_fp32 = self.w13_weight_scale.data.to(
-                torch.float32)
-            self.w2_weight_scale_fp32 = self.w2_weight_scale.data.to(
-                torch.float32)
+                self._register_w8a8_weight_list(name, template, num_experts,
+                                                device)
+            elif use_w8a8 and name == "w13_weight_scale":
+                self._register_w8a8_scale_lists(name, template, num_experts,
+                                                device, keep_original=False)
+            elif use_w8a8 and name == "w2_weight_scale":
+                self._register_w8a8_scale_lists(name, template, num_experts,
+                                                device)
+            else:
+                self.register_parameter(
+                    name,
+                    nn.Parameter(
+                        torch.empty((num_experts, *template.shape[1:]),
+                                    dtype=template.dtype,
+                                    device=device),
+                        requires_grad=False,
+                    ))
         self.load_stream: torch.npu.Stream | None = None
 
     def load_from_cpu(self, weights: dict[str, torch.Tensor]) -> None:
         with torch.no_grad():
             for name, source in weights.items():
-                target = getattr(self, name)
-                target[:source.size(0)].copy_(source, non_blocking=True)
-                if name in ("w13_weight_scale", "w2_weight_scale"):
-                    getattr(self, f"{name}_fp32")[:source.size(0)].copy_(
+                tensor_list = getattr(self, f"{name}_list", None)
+                if tensor_list is None and hasattr(self, name):
+                    getattr(self, name)[:source.size(0)].copy_(
                         source, non_blocking=True)
+                elif tensor_list is not None:
+                    for target, expert_source in zip(tensor_list, source):
+                        target.copy_(expert_source, non_blocking=True)
+
+                if name in ("w13_weight_scale", "w2_weight_scale"):
+                    fp32_list = getattr(self, f"{name}_fp32_list", None)
+                    if fp32_list is None:
+                        getattr(self, f"{name}_fp32")[:source.size(0)].copy_(
+                            source, non_blocking=True)
+                    else:
+                        for target, expert_source in zip(fp32_list, source):
+                            target.copy_(expert_source, non_blocking=True)
 
     def wait(self) -> None:
         if self.load_stream is not None:
             torch.npu.current_stream().wait_stream(self.load_stream)
+
+    def _register_w8a8_weight_list(self, name: str, template: torch.Tensor,
+                                   num_experts: int,
+                                   device: torch.device) -> None:
+        tensors = []
+        for _ in range(num_experts):
+            tensor = torch.empty(template.shape[1:],
+                                 dtype=template.dtype,
+                                 device=device)
+            tensor = torch_npu.npu_format_cast(tensor, ACL_FORMAT_FRACTAL_NZ)
+            tensors.append(nn.Parameter(tensor, requires_grad=False))
+        setattr(self, f"{name}_list", nn.ParameterList(tensors))
+
+    def _register_w8a8_scale_lists(self, name: str, template: torch.Tensor,
+                                   num_experts: int,
+                                   device: torch.device,
+                                   keep_original: bool = True) -> None:
+        if keep_original:
+            tensors = [
+                nn.Parameter(torch.empty(template.shape[1:],
+                                         dtype=template.dtype,
+                                         device=device),
+                             requires_grad=False)
+                for _ in range(num_experts)
+            ]
+            setattr(self, f"{name}_list", nn.ParameterList(tensors))
+
+        tensors = [
+            nn.Parameter(torch.empty(template.shape[1:],
+                                     dtype=torch.float32,
+                                     device=device),
+                         requires_grad=False)
+            for _ in range(num_experts)
+        ]
+        setattr(self, f"{name}_fp32_list", nn.ParameterList(tensors))
 
 
 class PreparedColdExperts(NamedTuple):
@@ -88,6 +138,7 @@ class ExoExecutor(nn.Module):
         self.history_mapping = (
             HistoryExpertMap(config.load_history_path)
             if config.enable_history_mapping else None)
+        self.collect_load = bool(config.load_history_path)
 
         self.layers: dict[int, nn.Module] = {}
         self.layer_ids: list[int] = []
@@ -178,6 +229,7 @@ class ExoExecutor(nn.Module):
         self.memory_manager.process_layer_after_loading(layer.moe_instance_id,
                                                         quant_method)
         self._init_cold_buffers()
+        torch.npu.synchronize()
         torch.npu.empty_cache()
 
     def prepare_cold_experts(self, layer,

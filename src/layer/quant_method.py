@@ -77,12 +77,20 @@ class RuntimeFusedMoEMethod:
         )
         return output
 
+    @staticmethod
+    def _unwrap_result(result):
+        return result[0] if isinstance(result, tuple) else result
+
+    def _offload_dynamic_eplb(self, layer) -> bool:
+        return layer.exo_executor.collect_load
+
     def _apply_split_offload(self, layer, moe_comm_method, x, topk_weights,
                              topk_ids, cold_experts, cold_topk_ids, cold_mask,
                              shared_experts, apply_router_weight_on_input,
                              mc2_mask, pertoken_scale):
         output = torch.zeros_like(x)
         num_rows = x.size(0)
+        dynamic_eplb = self._offload_dynamic_eplb(layer)
 
         hot_topk_ids, hot_mask = layer.build_hot_local_routing(topk_ids,
                                                                cold_mask)
@@ -96,14 +104,18 @@ class RuntimeFusedMoEMethod:
             hot_output = self._run_experts(
                 layer, moe_comm_method, layer, hot_routing,
                 layer.resident_local_num_experts, None, None, 0,
-                shared_experts, apply_router_weight_on_input, True,
+                shared_experts, apply_router_weight_on_input,
+                dynamic_eplb,
                 select_optional_rows(mc2_mask, hot_routing.row_indices,
                                      num_rows),
                 select_optional_rows(pertoken_scale, hot_routing.row_indices,
                                      num_rows))
-            hot_output = self._record_and_unwrap(
-                layer, hot_output,
-                layer.exo_executor.resident_slot_to_global(layer))
+            if layer.exo_executor.collect_load:
+                hot_output = self._record_and_unwrap(
+                    layer, hot_output,
+                    layer.exo_executor.resident_slot_to_global(layer))
+            else:
+                hot_output = self._unwrap_result(hot_output)
             add_routing_output(output, hot_routing, hot_output)
 
         cold_experts.wait()
@@ -118,14 +130,17 @@ class RuntimeFusedMoEMethod:
             cold_output = self._run_experts(
                 layer, moe_comm_method, cold_experts, cold_routing,
                 cold_experts.num_experts, None, None, 0, None,
-                apply_router_weight_on_input, True,
+                apply_router_weight_on_input, dynamic_eplb,
                 select_optional_rows(mc2_mask, cold_routing.row_indices,
                                      num_rows),
                 select_optional_rows(pertoken_scale, cold_routing.row_indices,
                                      num_rows))
-            cold_output = self._record_and_unwrap(
-                layer, cold_output,
-                layer.exo_executor.cold_slot_to_global(layer))
+            if layer.exo_executor.collect_load:
+                cold_output = self._record_and_unwrap(
+                    layer, cold_output,
+                    layer.exo_executor.cold_slot_to_global(layer))
+            else:
+                cold_output = self._unwrap_result(cold_output)
             add_routing_output(output, cold_routing, cold_output)
         return output
 
@@ -218,12 +233,15 @@ class RuntimeFusedMoEMethod:
                 global_redundant_expert_num=0,
                 shared_experts=shared_experts,
                 apply_router_weight_on_input=apply_router_weight_on_input,
-                dynamic_eplb=True,
+                dynamic_eplb=self._offload_dynamic_eplb(layer),
                 mc2_mask=mc2_mask,
                 pertoken_scale=pertoken_scale,
             )
-            return self._record_and_unwrap(
-                layer, result, layer.exo_executor.cold_slot_to_global(layer))
+            if layer.exo_executor.collect_load:
+                return self._record_and_unwrap(
+                    layer, result,
+                    layer.exo_executor.cold_slot_to_global(layer))
+            return self._unwrap_result(result)
 
         return self._apply_split_offload(
             layer, moe_comm_method, x, topk_weights, topk_ids, cold_experts,
@@ -253,6 +271,8 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
             layer.lbvc_adaptor.process_layer_after_loading(layer, self)
         elif layer.runtime_config.runtime_mode == "offload":
             layer.exo_executor.process_layer_after_loading(layer, self)
+            if layer.exo_executor.offload_full_layer:
+                _release_layer_weights(layer, ("w13_weight", "w2_weight"))
 
     def process_offloaded_weights(self,
                                   tensors: dict[str, torch.Tensor]) -> None:
@@ -305,22 +325,30 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
     def create_weights(self, *args, **kwargs):
         return self.base_method.create_weights(*args, **kwargs)
 
+    def _offload_dynamic_eplb(self, layer) -> bool:
+        return layer.runtime_config.runtime_mode == "offload"
+
     def process_weights_after_loading(self, layer):
         self.base_method.process_weights_after_loading(layer)
         if layer.runtime_config.runtime_mode == "balance":
-            self._prepare_balance_weight_views(layer)
+            self._prepare_weight_lists(layer)
             layer.lbvc_adaptor.process_layer_after_loading(layer, self)
         elif layer.runtime_config.runtime_mode == "offload":
             layer.exo_executor.process_layer_after_loading(layer, self)
+            if layer.exo_executor.offload_full_layer:
+                self._release_weight_tensors(layer)
+            else:
+                self._prepare_weight_lists(layer)
 
     def process_offloaded_weights(self,
                                   tensors: dict[str, torch.Tensor]) -> None:
         for name in ("w13_weight", "w2_weight"):
             tensors[name] = tensors[name].transpose(1, 2).contiguous()
-        for name in ("w13_weight_scale", "w13_weight_offset",
-                     "w2_weight_scale", "w2_weight_offset"):
+        for name in ("w13_weight_scale", "w2_weight_scale"):
             tensors[name] = tensors[name].view(tensors[name].shape[0],
                                                -1).contiguous()
+        tensors.pop("w13_weight_offset", None)
+        tensors.pop("w2_weight_offset", None)
 
     def _fused_experts(self, layer, moe_comm_method, experts, hidden_states,
                        topk_weights, topk_ids, global_num_experts, expert_map,
@@ -332,14 +360,17 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
         w1_scale = self._tensor_list(
             experts, "w13_weight_scale_fp32_list", "w13_weight_scale_fp32")
         w2 = self._tensor_list(experts, "w2_weight_list", "w2_weight")
-        w2_scale = getattr(experts, "w2_weight_scale_list", None)
-        if w2_scale is None:
-            w2_scale_tensor = (
-                experts.w2_weight_scale_fp32
-                if context.moe_comm_type == MoECommType.FUSED_MC2
-                and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2 else
-                experts.w2_weight_scale)
-            w2_scale = [w2_scale_tensor]
+        w2_scale_name = (
+            "w2_weight_scale_fp32"
+            if context.moe_comm_type == MoECommType.FUSED_MC2
+            and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2 else
+            "w2_weight_scale")
+        w2_scale_list_name = (
+            "w2_weight_scale_fp32_list"
+            if w2_scale_name == "w2_weight_scale_fp32" else
+            "w2_weight_scale_list")
+        w2_scale = self._tensor_list(experts, w2_scale_list_name,
+                                     w2_scale_name)
         local_num_experts = len(w1)
         eplb_kwargs = {}
         if log2phy is not None:
@@ -367,13 +398,22 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
 
     @staticmethod
     def _tensor_list(experts, list_name: str, tensor_name: str) -> list:
+        split_dim = 1 if "scale" in tensor_name or "offset" in tensor_name else 4
         tensor_list = getattr(experts, list_name, None)
         if tensor_list is not None:
+            if tensor_list and tensor_list[0].dim() > split_dim:
+                tensor_list = list(tensor_list[0].unbind(dim=0))
+                setattr(experts, list_name, tensor_list)
             return tensor_list
-        return [getattr(experts, tensor_name)]
+        tensor = getattr(experts, tensor_name)
+        if tensor.dim() > split_dim:
+            tensor_list = list(tensor.unbind(dim=0))
+            setattr(experts, list_name, tensor_list)
+            return tensor_list
+        return [tensor]
 
     @staticmethod
-    def _prepare_balance_weight_views(layer) -> None:
+    def _prepare_weight_lists(layer) -> None:
         layer.w13_weight_list = [
             weight.clone() for weight in layer.w13_weight.data.unbind(dim=0)
         ]
@@ -388,12 +428,48 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
             weight.clone()
             for weight in layer.w2_weight_scale.data.unbind(dim=0)
         ]
-        del layer.w13_weight
-        del layer.w2_weight
-        del layer.w13_weight_scale
-        del layer.w13_weight_scale_fp32
-        del layer.w2_weight_scale
-        torch.npu.empty_cache()
+        if hasattr(layer, "w2_weight_scale_fp32"):
+            layer.w2_weight_scale_fp32_list = [
+                weight.clone()
+                for weight in layer.w2_weight_scale_fp32.data.unbind(dim=0)
+            ]
+        _release_layer_weights(
+            layer,
+            (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w13_weight_scale_fp32",
+                "w13_weight_offset",
+                "w2_weight_scale",
+                "w2_weight_scale_fp32",
+                "w2_weight_offset",
+            ),
+        )
+
+    @staticmethod
+    def _release_weight_tensors(layer) -> None:
+        _release_layer_weights(
+            layer,
+            (
+                "w13_weight",
+                "w2_weight",
+                "w13_weight_scale",
+                "w13_weight_scale_fp32",
+                "w13_weight_offset",
+                "w2_weight_scale",
+                "w2_weight_scale_fp32",
+                "w2_weight_offset",
+            ),
+        )
+
+
+def _release_layer_weights(layer, names: tuple[str, ...]) -> None:
+    for name in names:
+        if hasattr(layer, name):
+            delattr(layer, name)
+    torch.npu.synchronize()
+    torch.npu.empty_cache()
 
 
 def wrap_quant_method(method):

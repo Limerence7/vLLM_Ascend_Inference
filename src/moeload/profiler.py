@@ -17,8 +17,8 @@ class ExpertLoadProfiler:
                  path: str | None = None,
                  metadata: dict[str, Any] | None = None):
         self.path = path
-        self.rank = dist.get_rank() if dist.is_available(
-        ) and dist.is_initialized() else 0
+        self.rank = self._get_rank()
+        
         self._layers: dict[int, int] = {}
         self._counts: dict[int, torch.Tensor] = {}
         self._local_to_global: dict[int, torch.Tensor] = {}
@@ -29,6 +29,11 @@ class ExpertLoadProfiler:
     def output_path(self) -> str | None:
         path = self._rank_file_path(self.path)
         return None if path is None else str(path)
+    
+    def _get_rank(self) -> int:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+        return 0
 
     def register_layer(self, layer) -> None:
         layer_id = layer.moe_instance_id
@@ -75,8 +80,6 @@ class ExpertLoadProfiler:
 
         slot_to_global = slot_to_global.to(device="cpu", dtype=torch.long)
         size = min(local_counts.numel(), slot_to_global.numel())
-        if size == 0:
-            return
         global_ids = slot_to_global[:size]
         valid = (global_ids >= 0) & (global_ids < num_experts)
         global_counts.index_add_(0, global_ids[valid],
@@ -84,12 +87,10 @@ class ExpertLoadProfiler:
         self._counts[layer_id].add_(global_counts)
 
     def get_layer_load(self, layer_id: int) -> torch.Tensor:
-        return self._counts[int(layer_id)].detach().cpu().clone()
+        return self._counts[layer_id].detach().cpu()
 
     def save(self) -> None:
         target_path = self._rank_file_path(self.path)
-        if target_path is None:
-            return
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -113,10 +114,11 @@ class ExpertLoadProfiler:
                    group_list_type: int) -> torch.Tensor:
         if group_list_type == 1:
             return expert_tokens.detach()
-        return torch.cat([
-            expert_tokens[:1],
-            expert_tokens[1:] - expert_tokens[:-1],
-        ]).detach()
+        else:
+            return torch.cat([
+                expert_tokens[:1],
+                expert_tokens[1:] - expert_tokens[:-1],
+            ]).detach()
 
     @staticmethod
     def _build_local_to_global(layer) -> torch.Tensor:
@@ -132,16 +134,10 @@ class ExpertLoadProfiler:
                                      device="cpu")
         for global_id, local_id in enumerate(full_map.tolist()):
             if local_id >= 0:
-                local_to_global[int(local_id)] = int(global_id)
+                local_to_global[local_id] = global_id
         return local_to_global
 
-    @classmethod
-    def _rank_file_path(cls, path: str | None) -> Path | None:
-        if not path:
-            return None
-
+    def _rank_file_path(self, path: str | None) -> Path | None:
         directory = Path(path)
-        rank = dist.get_rank() if dist.is_available(
-        ) and dist.is_initialized() else 0
-        rank_name = f"{directory.name}_rank{rank}"
+        rank_name = f"{directory.name}_rank{self.rank}"
         return directory / f"{rank_name}.json"
