@@ -24,6 +24,9 @@ class RuntimeConfig:
     shared_cpu_expert_dir: str = "/dev/shm/vllm_ascend_runtime"
     shared_cpu_expert_name: str | None = None
 
+    enable_offline_scheduler: bool = False
+    min_step_tokens: int = 4000
+
     def validate(self) -> None:
         self.runtime_mode = self.runtime_mode.strip().lower()
         assert self.runtime_mode in RUNTIME_MODES, (
@@ -35,6 +38,8 @@ class RuntimeConfig:
             'policy_interval must be a positive integer.')
         assert self.num_experts_per_update > 0, (
             'num_experts_per_update must be a positive integer.')
+        assert self.min_step_tokens >= 0, (
+            'min_step_tokens must be a non-negative integer.')
         if self.runtime_mode == "profile":
             assert self.num_runtime_experts == 0, (
                 'profile mode must keep num_runtime_experts at 0.')
@@ -89,9 +94,6 @@ class RuntimeConfig:
                 if 0 <= layer_id < num_layers
             ]
             return
-
-        if self.uses_cold_buffer and self.offload_count >= num_experts:
-            layer_ids = []
 
         self.runtime_layer_ids = [
             layer_id for layer_id in layer_ids

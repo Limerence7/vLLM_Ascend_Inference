@@ -7,63 +7,74 @@ import torch
 import torch.distributed as dist
 
 
-@dataclass(frozen=True)
-class HistoryLayerLoad:
-    global_load: torch.Tensor
-
-
 class LoadHistory:
-    """Read and broadcast saved profiler output."""
+    """Load profiler records and expose one global load vector per layer."""
 
     _cpu_group = None
 
     def __init__(self, history_path: str | None):
         self.history_path = history_path
-        self._loads: dict[int, HistoryLayerLoad | None] = {}
+        self._loads: dict[int, torch.Tensor | None] = {}
 
     def global_load_for_layer(self, layer) -> torch.Tensor | None:
         layer_id = int(layer.moe_instance_id)
         if layer_id not in self._loads:
             self._loads[layer_id] = self._broadcast_load(layer)
-        load = self._loads[layer_id]
-        return None if load is None else load.global_load
+        return self._loads[layer_id]
 
-    def _broadcast_load(self, layer) -> HistoryLayerLoad | None:
+    def _broadcast_load(self, layer) -> torch.Tensor | None:
         load = self._build_load(layer) if self._is_rank0() else None
         if not dist.is_available() or not dist.is_initialized():
             return load
         if dist.get_world_size() == 1:
             return load
 
-        payload: list[HistoryLayerLoad | None] = [load]
+        payload: list[torch.Tensor | None] = [load]
         dist.broadcast_object_list(payload, src=0, group=self._get_cpu_group())
         return payload[0]
 
-    def _build_load(self, layer) -> HistoryLayerLoad | None:
+    def _build_load(self, layer) -> torch.Tensor | None:
         if not self.history_path:
             return None
 
+        layer_id = int(layer.moe_instance_id)
         num_experts = int(
             getattr(layer, "logical_num_experts", layer.global_num_experts))
         total = torch.zeros(num_experts, dtype=torch.long)
         found = False
-        for rank in range(int(layer.ep_size)):
-            counts = self._read_rank_load(rank, int(layer.moe_instance_id))
-            if counts is None or len(counts) != num_experts:
-                continue
-            found = True
-            total += torch.tensor(counts, dtype=torch.long)
-        return HistoryLayerLoad(total) if found else None
 
-    def _read_rank_load(self, rank: int, layer_id: int) -> list[int] | None:
+        for rank in range(int(layer.ep_size)):
+            rank_load = self._read_rank_load(rank, layer_id, num_experts)
+            if rank_load is None:
+                continue
+            total += rank_load
+            found = True
+
+        return total if found else None
+
+    def _read_rank_load(
+        self,
+        rank: int,
+        layer_id: int,
+        num_experts: int,
+    ) -> torch.Tensor | None:
         path = self._rank_file_path(rank)
         if not path.exists():
             return None
 
         with open(path, "r", encoding="utf-8") as file:
             payload: dict[str, Any] = json.load(file)
-        counts = payload.get("layers", {}).get(str(layer_id))
-        return counts if isinstance(counts, list) else None
+
+        layer_record = payload.get("layers", {}).get(str(layer_id))
+        if not isinstance(layer_record, dict):
+            return None
+
+        load = torch.zeros(num_experts, dtype=torch.long)
+        for record in layer_record.get("experts", []):
+            expert_id = int(record["expert_id"])
+            if 0 <= expert_id < num_experts:
+                load[expert_id] += int(record["activated_tokens"])
+        return load
 
     def _rank_file_path(self, rank: int) -> Path:
         assert self.history_path is not None
@@ -91,7 +102,7 @@ class BalancePlan:
 
 
 class ExpertPolicy:
-    """Pure expert-placement policy for offload and balance modes."""
+    """Expert placement policy for offload and balance modes."""
 
     def __init__(self, history_path: str | None = None):
         self.history = LoadHistory(history_path)
@@ -108,16 +119,14 @@ class ExpertPolicy:
         if num_resident <= 0:
             return []
 
-        local_experts = self._local_experts(layer)
         local_by_global = {
             global_id: local_id
-            for local_id, global_id in local_experts
+            for local_id, global_id in self._local_experts(layer)
         }
-        ranked_global = ranked_experts_by_load(global_load,
-                                               list(local_by_global))
         return [
             local_by_global[global_id]
-            for global_id in ranked_global[:num_resident]
+            for global_id in ranked_experts_by_load(
+                global_load, list(local_by_global))[:num_resident]
         ]
 
     def balance_plan(
@@ -129,41 +138,33 @@ class ExpertPolicy:
         global_load: torch.Tensor | None,
     ) -> BalancePlan:
         if num_experts % ep_size != 0:
-            raise ValueError(
-                "balance mode requires experts evenly split by EP.")
+            raise ValueError("balance mode requires evenly split experts.")
 
-        base_experts_per_rank = num_experts // ep_size
-        local_slots = base_experts_per_rank + redundant_per_rank
+        base_slots = num_experts // ep_size
+        slots_per_rank = base_slots + redundant_per_rank
         global_num_experts = num_experts + ep_size * redundant_per_rank
 
         if global_load is None:
-            all_maps = self._base_maps(
-                ep_size, num_experts, base_experts_per_rank,
-                global_num_experts)
-            if redundant_per_rank > 0:
-                self._place_redundant_experts(all_maps, num_experts,
-                                              base_experts_per_rank,
-                                              redundant_per_rank, global_load)
+            target_slots = self._native_slots(num_experts, ep_size)
+            self._append_redundant_slots(target_slots, redundant_per_rank)
         else:
             target_slots = self.global_balance_slots(
                 counts=global_load,
                 num_experts=num_experts,
                 ep_size=ep_size,
-                slots_per_rank=local_slots,
-            )
-            all_maps = self.maps_from_slots(
-                target_slots=target_slots,
-                num_experts=num_experts,
-                global_num_experts=global_num_experts,
+                slots_per_rank=slots_per_rank,
             )
 
-        log2phy = self._build_log2phy(all_maps, num_experts, local_slots)
-        expert_map = all_maps[ep_rank]
+        expert_maps = self.maps_from_slots(
+            target_slots, num_experts, global_num_experts)
+        log2phy = self.log2phy_from_slots(
+            target_slots, num_experts, global_num_experts)
+        expert_map = expert_maps[ep_rank]
         return BalancePlan(
             expert_map=expert_map,
             log2phy=log2phy[ep_rank],
             redundant_experts=redundant_experts_from_map(
-                expert_map, base_experts_per_rank),
+                expert_map, base_slots),
         )
 
     def global_balance_slots(
@@ -173,31 +174,29 @@ class ExpertPolicy:
         ep_size: int,
         slots_per_rank: int,
     ) -> list[list[int]]:
-        load_values = self._load_values(counts, num_experts)
-        targets: list[list[int]] = [[] for _ in range(ep_size)]
-        rank_loads = [0.0 for _ in range(ep_size)]
+        if ep_size * slots_per_rank < num_experts:
+            raise ValueError("not enough slots to place every expert.")
 
-        for expert_id in ranked_experts_by_load(load_values,
-                                                list(range(num_experts))):
-            rank = self._lightest_rank(targets, rank_loads, slots_per_rank)
-            targets[rank].append(expert_id)
-            rank_loads[rank] += float(load_values[expert_id].item())
+        load = _load_tensor(counts, num_experts)
+        slots: list[list[int]] = [[] for _ in range(ep_size)]
+        rank_loads = [0.0] * ep_size
+        ranked = ranked_experts_by_load(load, list(range(num_experts)))
 
-        ranked = ranked_experts_by_load(load_values, list(range(num_experts)))
+        for expert_id in ranked:
+            rank = _lightest_rank(slots, rank_loads, slots_per_rank)
+            slots[rank].append(expert_id)
+            rank_loads[rank] += float(load[expert_id])
+
         replica_index = 0
-        while any(len(slots) < slots_per_rank for slots in targets):
+        while any(len(rank_slots) < slots_per_rank for rank_slots in slots):
             expert_id = ranked[replica_index % len(ranked)]
-            rank = self._lightest_rank(
-                targets,
-                rank_loads,
-                slots_per_rank,
-                exclude_expert=expert_id,
-            )
-            targets[rank].append(expert_id)
-            rank_loads[rank] += float(load_values[expert_id].item())
+            rank = _lightest_rank(
+                slots, rank_loads, slots_per_rank, exclude=expert_id)
+            slots[rank].append(expert_id)
+            rank_loads[rank] += float(load[expert_id])
             replica_index += 1
 
-        return targets
+        return slots
 
     @staticmethod
     def maps_from_slots(
@@ -205,14 +204,13 @@ class ExpertPolicy:
         num_experts: int,
         global_num_experts: int,
     ) -> torch.Tensor:
-        all_maps = torch.full((len(target_slots), global_num_experts),
-                              -1,
-                              dtype=torch.int32)
-        for rank, experts in enumerate(target_slots):
-            for slot, expert_id in enumerate(experts):
-                if expert_id < num_experts:
-                    all_maps[rank, expert_id] = slot
-        return all_maps
+        expert_maps = torch.full((len(target_slots), global_num_experts),
+                                 -1,
+                                 dtype=torch.int32)
+        for rank, rank_slots in enumerate(target_slots):
+            for slot, expert_id in enumerate(rank_slots):
+                expert_maps[rank, expert_id] = slot
+        return expert_maps
 
     @staticmethod
     def log2phy_from_slots(
@@ -221,164 +219,57 @@ class ExpertPolicy:
         global_num_experts: int | None = None,
     ) -> torch.Tensor:
         global_num_experts = global_num_experts or num_experts
-        return ExpertPolicy._build_log2phy(
-            ExpertPolicy.maps_from_slots(
-                target_slots,
-                num_experts,
-                global_num_experts,
-            ),
-            num_experts,
-            len(target_slots[0]),
-        )
+        slots_per_rank = len(target_slots[0])
+        log2phy = torch.zeros((len(target_slots), global_num_experts),
+                              dtype=torch.int32)
+        physical_slots = _physical_slots_by_expert(target_slots,
+                                                   num_experts)
+
+        for rank, rank_slots in enumerate(target_slots):
+            local_map = {expert_id: slot
+                         for slot, expert_id in enumerate(rank_slots)}
+            for expert_id in range(num_experts):
+                if expert_id in local_map:
+                    slot = rank * slots_per_rank + local_map[expert_id]
+                else:
+                    slots = physical_slots[expert_id]
+                    slot = slots[(rank + expert_id) % len(slots)]
+                log2phy[rank, expert_id] = slot
+        return log2phy
 
     def should_rebalance(self, counts: torch.Tensor,
                          imbalance_threshold: float) -> bool:
         if counts.numel() == 0:
             return False
         mean = float(counts.float().mean().item())
-        if mean <= 0:
-            return False
-        spread = float(counts.max().item() - counts.min().item()) / mean
-        return spread >= imbalance_threshold
-
-    def replacement_candidates(
-        self,
-        counts: torch.Tensor,
-        current_experts: list[int],
-        num_experts: int,
-    ) -> list[int]:
-        current = set(current_experts)
-        candidates = [
-            expert_id for expert_id in range(num_experts)
-            if expert_id not in current
-        ]
-        return ranked_experts_by_load(counts, candidates)
+        return mean > 0 and (
+            float(counts.max().item() - counts.min().item()) / mean
+            >= imbalance_threshold)
 
     @staticmethod
-    def least_loaded_slot(
-        counts: torch.Tensor,
-        current_experts: list[int],
-        used_slots: set[int],
-    ) -> int:
-        available = [
-            index for index in range(len(current_experts))
-            if index not in used_slots
+    def _native_slots(num_experts: int, ep_size: int) -> list[list[int]]:
+        base_slots = num_experts // ep_size
+        return [
+            list(range(rank * base_slots, (rank + 1) * base_slots))
+            for rank in range(ep_size)
         ]
-        if not available:
-            return -1
-        loads = [int(counts[expert_id].item()) for expert_id in current_experts]
-        return min(available, key=loads.__getitem__)
 
     @staticmethod
-    def _lightest_rank(
-        targets: list[list[int]],
-        rank_loads: list[float],
-        slots_per_rank: int,
-        exclude_expert: int | None = None,
-    ) -> int:
-        ranks = [
-            rank for rank, experts in enumerate(targets)
-            if len(experts) < slots_per_rank
-            and (exclude_expert is None or exclude_expert not in experts)
-        ]
-        if not ranks:
-            ranks = [
-                rank for rank, experts in enumerate(targets)
-                if len(experts) < slots_per_rank
-            ]
-        return min(ranks, key=lambda rank:
-                   (rank_loads[rank], len(targets[rank]), rank))
-
-    @staticmethod
-    def _base_maps(ep_size: int, num_experts: int,
-                   base_experts_per_rank: int,
-                   global_num_experts: int) -> torch.Tensor:
-        maps = torch.full((ep_size, global_num_experts),
-                          -1,
-                          dtype=torch.int32)
-        for rank in range(ep_size):
-            start = rank * base_experts_per_rank
-            end = start + base_experts_per_rank
-            maps[rank, start:end] = torch.arange(base_experts_per_rank,
-                                                 dtype=torch.int32)
-        return maps
-
-    def _place_redundant_experts(
-        self,
-        all_maps: torch.Tensor,
-        num_experts: int,
-        base_experts_per_rank: int,
+    def _append_redundant_slots(
+        target_slots: list[list[int]],
         redundant_per_rank: int,
-        global_load: torch.Tensor | None,
     ) -> None:
-        replica_counts = torch.ones(num_experts, dtype=torch.long)
-        load_values = self._load_values(global_load, num_experts)
-        for rank in range(all_maps.size(0)):
-            for offset in range(redundant_per_rank):
-                candidates = [
-                    expert_id for expert_id in range(num_experts)
-                    if int(all_maps[rank, expert_id].item()) < 0
-                ]
-                if not candidates:
-                    continue
-                expert_id = self._select_redundant_expert(
-                    candidates, replica_counts, load_values,
-                    rank * redundant_per_rank + offset,
-                    global_load is not None)
-                all_maps[rank, expert_id] = base_experts_per_rank + offset
-                replica_counts[expert_id] += 1
+        if redundant_per_rank <= 0:
+            return
 
-    @staticmethod
-    def _select_redundant_expert(
-        candidates: list[int],
-        replica_counts: torch.Tensor,
-        load_values: torch.Tensor,
-        seed: int,
-        has_history: bool,
-    ) -> int:
-        if has_history:
-            return min(
-                candidates,
-                key=lambda expert_id:
-                (-float(load_values[expert_id].item()) /
-                 max(int(replica_counts[expert_id].item()), 1), expert_id),
-            )
-        num_experts = int(load_values.numel())
-        return min(candidates,
-                   key=lambda expert_id: ((expert_id - seed) % num_experts,
-                                          expert_id))
-
-    @staticmethod
-    def _build_log2phy(all_maps: torch.Tensor, num_experts: int,
-                       local_slots: int) -> torch.Tensor:
-        ep_size, global_num_experts = all_maps.shape
-        log2phy = torch.zeros((ep_size, global_num_experts), dtype=torch.int32)
-        expert_slots: dict[int, list[int]] = {}
-
-        for rank in range(ep_size):
-            for expert_id in range(num_experts):
-                local_slot = int(all_maps[rank, expert_id].item())
-                if local_slot >= 0:
-                    expert_slots.setdefault(expert_id, []).append(
-                        rank * local_slots + local_slot)
-
-        for rank in range(ep_size):
-            for expert_id in range(num_experts):
-                local_slot = int(all_maps[rank, expert_id].item())
-                if local_slot >= 0:
-                    log2phy[rank, expert_id] = rank * local_slots + local_slot
-                else:
-                    slots = expert_slots.get(expert_id, [0])
-                    log2phy[rank, expert_id] = slots[
-                        (rank + expert_id) % len(slots)]
-        return log2phy
-
-    @staticmethod
-    def _load_values(global_load: torch.Tensor | None,
-                     num_experts: int) -> torch.Tensor:
-        if global_load is None:
-            return torch.zeros(num_experts, dtype=torch.float32)
-        return global_load.detach().cpu()[:num_experts].to(torch.float32)
+        num_experts = sum(len(rank_slots) for rank_slots in target_slots)
+        cursor = 0
+        for rank_slots in target_slots:
+            for _ in range(redundant_per_rank):
+                while cursor % num_experts in rank_slots:
+                    cursor += 1
+                rank_slots.append(cursor % num_experts)
+                cursor += 1
 
     @staticmethod
     def _local_experts(layer) -> list[tuple[int, int]]:
@@ -388,9 +279,9 @@ class ExpertPolicy:
                 for expert_id in range(int(layer.global_num_experts))
             ]
 
-        expert_map = layer.full_expert_map.detach().cpu()
-        return [(int(local_id), int(global_id))
-                for global_id, local_id in enumerate(expert_map.tolist())
+        expert_map = layer.full_expert_map.detach().cpu().tolist()
+        return [(local_id, global_id)
+                for global_id, local_id in enumerate(expert_map)
                 if local_id >= 0]
 
 
@@ -399,9 +290,9 @@ def redundant_experts_from_map(expert_map: torch.Tensor | None,
     if expert_map is None:
         return []
     return [
-        int(global_id)
-        for global_id, local_id in enumerate(expert_map.detach().cpu().tolist())
-        if int(local_id) >= local_count
+        expert_id
+        for expert_id, slot in enumerate(expert_map.detach().cpu().tolist())
+        if slot >= local_count
     ]
 
 
@@ -410,18 +301,45 @@ def ranked_experts_by_load(
     expert_ids: list[int],
 ) -> list[int]:
     if global_load is None:
-        return list(expert_ids)
+        return expert_ids
 
-    if isinstance(global_load, torch.Tensor):
-        load_values = global_load.detach().cpu().tolist()
-    else:
-        load_values = global_load
+    values = (global_load.detach().cpu().tolist()
+              if isinstance(global_load, torch.Tensor) else global_load)
+    return sorted(expert_ids, key=lambda expert_id:
+                  (-int(values[expert_id]), expert_id))
 
-    return sorted(
-        expert_ids,
-        key=lambda expert_id: (
-            -int(load_values[expert_id])
-            if 0 <= expert_id < len(load_values) else 0,
-            expert_id,
-        ),
-    )
+
+def _load_tensor(counts: torch.Tensor, num_experts: int) -> torch.Tensor:
+    return counts.detach().cpu()[:num_experts].to(torch.float32)
+
+
+def _lightest_rank(
+    slots: list[list[int]],
+    rank_loads: list[float],
+    slots_per_rank: int,
+    exclude: int | None = None,
+) -> int:
+    candidates = [
+        rank for rank, rank_slots in enumerate(slots)
+        if len(rank_slots) < slots_per_rank
+        and (exclude is None or exclude not in rank_slots)
+    ]
+    if not candidates:
+        candidates = [
+            rank for rank, rank_slots in enumerate(slots)
+            if len(rank_slots) < slots_per_rank
+        ]
+    return min(candidates, key=lambda rank:
+               (rank_loads[rank], len(slots[rank]), rank))
+
+
+def _physical_slots_by_expert(
+    target_slots: list[list[int]],
+    num_experts: int,
+) -> list[list[int]]:
+    slots_per_rank = len(target_slots[0])
+    physical_slots: list[list[int]] = [[] for _ in range(num_experts)]
+    for rank, rank_slots in enumerate(target_slots):
+        for slot, expert_id in enumerate(rank_slots):
+            physical_slots[expert_id].append(rank * slots_per_rank + slot)
+    return physical_slots

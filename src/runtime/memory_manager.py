@@ -188,6 +188,7 @@ class CpuExpertWeights:
         self.layer_id = int(layer.moe_instance_id)
         self.tp_rank = int(layer.tp_rank)
         self.shared_factory = shared_factory
+        self.expert_ids = expert_ids
         self.expert_id_to_slot = {
             expert_id: slot
             for slot, expert_id in enumerate(expert_ids)
@@ -239,7 +240,7 @@ class CpuExpertWeights:
     def get_weights(self,
                     expert_ids: list[int] | None = None
                     ) -> dict[str, torch.Tensor]:
-        if expert_ids is None:
+        if expert_ids is None or expert_ids == self.expert_ids:
             return self.tensors
 
         slots = [self.expert_id_to_slot[expert_id]

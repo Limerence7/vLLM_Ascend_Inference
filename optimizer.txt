@@ -1,0 +1,8 @@
+1. HistoryLayerLoad只有一个值，没必要单开一个类
+2. runtime_core可以先初始化profiler和memory_manager，然后再初始化adaptor和executor，在初始化后者时将前者作为参数传入，
+不需要再单独初始化。
+3. 很多变量，如果确定是str, int, list之类的固定类型，不要再进行强制转换
+4. _layer_device函数删除，然后修改其他代码保证该功能可用性。
+5. lbcv_adaptor使用了_load_initial_redundant_experts，不应该单独处理，应该最开始create_weights时就申请足够空间的tensor，
+然后调整load_weights加载权重。
+6. offload模式模型吞吐下降，对此作出优化。

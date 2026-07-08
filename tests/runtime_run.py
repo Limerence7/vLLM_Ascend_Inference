@@ -6,20 +6,20 @@ from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
 
-LOAD_HISTORY_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "load_records"
-    / "only_run_load_history"
-)
+# LOAD_HISTORY_PATH = (
+#     Path(__file__).resolve().parents[1]
+#     / "load_records"
+#     / "only_run_load_history"
+# )
 
-TEST_CONFIG = {
-    "model_path": "/workspace/models/Qwen3-30B-A3B",
-    "batch_size": 1024,
-    "max_length": 1024,
-    "max_new_tokens": 512,
-    "world_size": 2,
-    "utilization": 0.80,
-}
+# TEST_CONFIG = {
+#     "model_path": "/workspace/models/Qwen3-30B-A3B",
+#     "batch_size": 1024,
+#     "max_length": 1024,
+#     "max_new_tokens": 512,
+#     "world_size": 2,
+#     "utilization": 0.85,
+# }
 
 # LOAD_HISTORY_PATH = (
 #     Path(__file__).resolve().parents[1]
@@ -35,29 +35,30 @@ TEST_CONFIG = {
 #     "utilization": 0.80,
 # }
 
-# LOAD_HISTORY_PATH = (
-#     Path(__file__).resolve().parents[1]
-#     / "load_records"
-#     / "only_run_235b"
-# )
-# TEST_CONFIG = {
-#     "model_path": "/workspace/models/Qwen3-235B-A22B",
-#     "batch_size": 512,
-#     "max_length": 1024,
-#     "max_new_tokens": 32,
-#     "world_size": 8,
-#     "utilization": 0.98,
-# }
+LOAD_HISTORY_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "load_records"
+    / "only_run_235b"
+)
+TEST_CONFIG = {
+    "model_path": "/workspace/models/Qwen3-235B-A22B",
+    "batch_size": 512,
+    "max_length": 512,
+    "max_new_tokens": 512,
+    "world_size": 8,
+    "utilization": 0.98,
+}
 
 RUNTIME_CONFIG = RuntimeConfig(
     runtime_mode="offload",
-    interval=24,
+    interval=14,
     num_buffers=2,
-    num_runtime_experts=0,
-    num_experts_per_update = 2,
+    num_runtime_experts=-16,
+    # num_experts_per_update=2,
     cpu_pin_memory=True,
-    runtime_layer_ids=[],
+    runtime_layer_ids=[0, 14, 27, 40, 54, 68, 82],
     load_history_path=str(LOAD_HISTORY_PATH),
+    enable_offline_scheduler=False,
     enable_history_mapping=True,
 )
 

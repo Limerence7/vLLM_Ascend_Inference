@@ -15,11 +15,10 @@ class RuntimeWorkerExtension:
         if hasattr(recorder, "save_load_history"):
             recorder.save_load_history()
             profiler = recorder.profiler
-            num_layers = len(recorder.layers)
         else:
             recorder.save()
             profiler = recorder
-            num_layers = len(recorder._local_to_global)
+        num_layers = len(profiler._local_to_global)
 
         return {
             "saved": profiler.path is not None,

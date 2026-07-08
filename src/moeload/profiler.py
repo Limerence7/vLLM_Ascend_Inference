@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 
 
-LOAD_HISTORY_VERSION = 1
+LOAD_HISTORY_VERSION = 2
 
 
 class ExpertLoadProfiler:
@@ -109,7 +109,7 @@ class ExpertLoadProfiler:
             "version": LOAD_HISTORY_VERSION,
             "metadata": self._metadata,
             "layers": {
-                str(layer_id): counts.tolist()
+                str(layer_id): self._layer_record(layer_id, counts)
                 for layer_id, counts in sorted(self._counts.items())
             },
         }
@@ -120,6 +120,23 @@ class ExpertLoadProfiler:
             file.flush()
             os.fsync(file.fileno())
         os.replace(tmp_path, target_path)
+
+    def _layer_record(
+        self,
+        layer_id: int,
+        counts: torch.Tensor,
+    ) -> dict[str, Any]:
+        return {
+            "num_experts": self._layers[layer_id],
+            "experts": [
+                {
+                    "expert_id": expert_id,
+                    "activated_tokens": int(tokens),
+                }
+                for expert_id, tokens in enumerate(counts.tolist())
+                if int(tokens) > 0
+            ],
+        }
 
     @staticmethod
     def _to_counts(expert_tokens: torch.Tensor,

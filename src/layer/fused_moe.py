@@ -326,9 +326,8 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.moe_config.num_local_experts = self.resident_local_num_experts
         self.moe_config.original_num_experts = num_experts
 
-        npu_weight_slots = max(1, self.resident_local_num_experts)
         moe_quant_params = {
-            "num_experts": npu_weight_slots,
+            "num_experts": self.resident_local_num_experts,
             "hidden_size": self.hidden_size,
             "intermediate_size_per_partition":
             self.intermediate_size_per_partition,
@@ -483,7 +482,6 @@ class RuntimeAscendFusedMoE(FusedMoE):
         enable_force_load_balance = forward_context.in_profile_run
         moe_comm_method = forward_context.moe_comm_method
         if self.runtime_config.runtime_mode == "balance":
-            self.runtime_core.before_forward(self)
             moe_comm_type = getattr(forward_context, "moe_comm_type", None)
             uses_allgather = (
                 moe_comm_type == MoECommType.ALLGATHER

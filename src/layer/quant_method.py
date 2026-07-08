@@ -83,6 +83,56 @@ class RuntimeFusedMoEMethod:
     def _offload_dynamic_eplb(self, layer) -> bool:
         return layer.runtime_core.collect_load
 
+    def _wait_and_prefetch_next(self, layer, cold_experts) -> None:
+        cold_experts.wait()
+        layer.runtime_core.prefetch_next_layers(layer)
+
+    def _run_cold_experts(self, layer, moe_comm_method, x, topk_weights,
+                          cold_topk_ids, cold_mask, cold_experts,
+                          apply_router_weight_on_input, dynamic_eplb,
+                          mc2_mask, pertoken_scale):
+        num_rows = x.size(0)
+        cold_routing = build_routing_view(
+            hidden_states=x,
+            topk_ids=cold_topk_ids,
+            topk_weights=topk_weights.masked_fill(~cold_mask, 0),
+            row_mask=cold_mask.any(dim=1),
+        )
+        if cold_routing is None:
+            return None, None
+
+        cold_output = self._run_experts(
+            layer, moe_comm_method, cold_experts, cold_routing,
+            cold_experts.num_experts, None, None, 0, None,
+            apply_router_weight_on_input, dynamic_eplb,
+            select_optional_rows(mc2_mask, cold_routing.row_indices,
+                                 num_rows),
+            select_optional_rows(pertoken_scale, cold_routing.row_indices,
+                                 num_rows))
+        if layer.runtime_core.collect_load:
+            cold_output = self._record_and_unwrap(
+                layer, cold_output,
+                layer.runtime_core.cold_slot_to_global(layer))
+        else:
+            cold_output = self._unwrap_result(cold_output)
+        return cold_routing, cold_output
+
+    def _apply_cold_only(self, layer, moe_comm_method, x, topk_weights,
+                         cold_experts, cold_topk_ids, cold_mask,
+                         apply_router_weight_on_input, mc2_mask,
+                         pertoken_scale):
+        self._wait_and_prefetch_next(layer, cold_experts)
+        dynamic_eplb = self._offload_dynamic_eplb(layer)
+        cold_routing, cold_output = self._run_cold_experts(
+            layer, moe_comm_method, x, topk_weights, cold_topk_ids, cold_mask,
+            cold_experts, apply_router_weight_on_input, dynamic_eplb,
+            mc2_mask, pertoken_scale)
+        output = torch.zeros_like(x)
+        if cold_routing is None:
+            return output
+        add_routing_output(output, cold_routing, cold_output)
+        return output
+
     def _apply_split_offload(self, layer, moe_comm_method, x, topk_weights,
                              topk_ids, cold_experts, cold_topk_ids, cold_mask,
                              shared_experts, apply_router_weight_on_input,
@@ -117,29 +167,12 @@ class RuntimeFusedMoEMethod:
                 hot_output = self._unwrap_result(hot_output)
             add_routing_output(output, hot_routing, hot_output)
 
-        cold_experts.wait()
-        layer.runtime_core.prefetch_next_layers(layer)
-        cold_routing = build_routing_view(
-            hidden_states=x,
-            topk_ids=cold_topk_ids,
-            topk_weights=topk_weights.masked_fill(~cold_mask, 0),
-            row_mask=cold_mask.any(dim=1),
-        )
+        self._wait_and_prefetch_next(layer, cold_experts)
+        cold_routing, cold_output = self._run_cold_experts(
+            layer, moe_comm_method, x, topk_weights, cold_topk_ids, cold_mask,
+            cold_experts, apply_router_weight_on_input, dynamic_eplb,
+            mc2_mask, pertoken_scale)
         if cold_routing is not None:
-            cold_output = self._run_experts(
-                layer, moe_comm_method, cold_experts, cold_routing,
-                cold_experts.num_experts, None, None, 0, None,
-                apply_router_weight_on_input, dynamic_eplb,
-                select_optional_rows(mc2_mask, cold_routing.row_indices,
-                                     num_rows),
-                select_optional_rows(pertoken_scale, cold_routing.row_indices,
-                                     num_rows))
-            if layer.runtime_core.collect_load:
-                cold_output = self._record_and_unwrap(
-                    layer, cold_output,
-                    layer.runtime_core.cold_slot_to_global(layer))
-            else:
-                cold_output = self._unwrap_result(cold_output)
             add_routing_output(output, cold_routing, cold_output)
         return output
 
@@ -215,6 +248,12 @@ class RuntimeFusedMoEMethod:
 
         prepared_cold_experts = layer.runtime_core.prepare_cold_experts(
             layer, topk_ids)
+        if layer.resident_local_num_experts == 0:
+            return self._apply_cold_only(
+                layer, moe_comm_method, x, topk_weights,
+                prepared_cold_experts.experts, prepared_cold_experts.topk_ids,
+                prepared_cold_experts.mask, apply_router_weight_on_input,
+                mc2_mask, pertoken_scale)
         return self._apply_split_offload(
             layer, moe_comm_method, x, topk_weights, topk_ids,
             prepared_cold_experts.experts, prepared_cold_experts.topk_ids,
@@ -294,7 +333,7 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
         return self.base_method.create_weights(*args, **kwargs)
 
     def _offload_dynamic_eplb(self, layer) -> bool:
-        return layer.runtime_config.uses_cold_buffer
+        return layer.runtime_core.collect_load
 
     def process_weights_after_loading(self, layer):
         self.base_method.process_weights_after_loading(layer)

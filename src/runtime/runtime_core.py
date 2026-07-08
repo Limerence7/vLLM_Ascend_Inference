@@ -24,7 +24,17 @@ class RuntimeCore:
 
     def __init__(self, config: RuntimeConfig, uses_w8a8: bool):
         self.config = config
-        if config.runtime_mode in ("offload", "balance"):
+        if RuntimeCore._profiler is None:
+            RuntimeCore._profiler = ExpertLoadProfiler(
+                config.load_history_path,
+                metadata={
+                    "runtime_mode": config.runtime_mode,
+                    "runtime_layer_ids": list(config.runtime_layer_ids),
+                },
+            )
+        self.profiler = RuntimeCore._profiler
+
+        if config.uses_runtime_core:
             if RuntimeCore._memory_manager is None:
                 RuntimeCore._memory_manager = ExpertMemoryManager(
                     cpu_pin_memory=config.cpu_pin_memory,
@@ -37,7 +47,7 @@ class RuntimeCore:
             self.memory_manager = RuntimeCore._memory_manager
             if RuntimeCore._executor is None:
                 RuntimeCore._executor = ExoExecutor(
-                    config, uses_w8a8, self.memory_manager)
+                    config, uses_w8a8, self.memory_manager, self.profiler)
             self.executor = RuntimeCore._executor
         else:
             self.memory_manager = None
@@ -46,30 +56,16 @@ class RuntimeCore:
         if config.runtime_mode == "balance":
             assert self.executor is not None
             if RuntimeCore._adaptor is None:
-                RuntimeCore._adaptor = LBVCAdaptor(config, self.executor)
+                RuntimeCore._adaptor = LBVCAdaptor(
+                    config, self.executor, self.profiler)
             self.adaptor = RuntimeCore._adaptor
         else:
             self.adaptor = None
 
-        if config.runtime_mode == "profile":
-            if RuntimeCore._profiler is None:
-                RuntimeCore._profiler = ExpertLoadProfiler(
-                    config.load_history_path,
-                    metadata={
-                        "runtime_mode": config.runtime_mode,
-                        "runtime_layer_ids": list(config.runtime_layer_ids),
-                    },
-                )
-            self.profiler = RuntimeCore._profiler
-        elif self.executor is not None:
-            self.profiler = self.executor.profiler
-        else:
-            self.profiler = None
-
     def global_load_for_layer(self, layer) -> torch.Tensor | None:
-        if self.adaptor is None:
-            return None
-        return self.adaptor.global_load_for_layer(layer)
+        return (
+            None if self.adaptor is None else
+            self.adaptor.global_load_for_layer(layer))
 
     def initial_balance_maps(
         self,
@@ -106,7 +102,7 @@ class RuntimeCore:
         elif self.config.runtime_mode == "offload":
             assert self.executor is not None
             self.executor.register_layer(layer)
-        elif self.profiler is not None:
+        else:
             self.profiler.register_layer(layer)
 
     def load_weight(self, layer, param_name: str, shard_id: str,
@@ -128,10 +124,6 @@ class RuntimeCore:
         elif self.config.runtime_mode == "offload":
             assert self.executor is not None
             self.executor.process_layer_after_loading(layer, quant_method)
-
-    def before_forward(self, layer) -> None:
-        if self.adaptor is not None:
-            self.adaptor.before_forward(layer)
 
     def prepare_cold_experts(self, layer, topk_ids: torch.Tensor):
         assert self.executor is not None
@@ -159,7 +151,7 @@ class RuntimeCore:
             assert self.executor is not None
             self.executor.record_expert_tokens(layer, group_list_type,
                                                expert_tokens)
-        elif self.profiler is not None:
+        else:
             self.profiler.record_expert_tokens(
                 int(layer.moe_instance_id), expert_tokens, group_list_type)
 
@@ -179,5 +171,5 @@ class RuntimeCore:
             self.adaptor.save_load_history()
         elif self.executor is not None:
             self.executor.save_load_history()
-        elif self.profiler is not None:
+        else:
             self.profiler.save()

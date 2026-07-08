@@ -38,16 +38,25 @@ class LayerRoutingMap:
 
     def __init__(self, layer, placement: ExpertPlacement):
         self.local_num_experts = int(layer.full_local_num_experts)
+        self.global_num_experts = int(layer.global_num_experts)
         self.global_to_local = self._build_global_to_local(layer)
         self.local_to_cold_slot = self._build_local_to_cold_slot(placement)
+        self.global_to_cold_slot: torch.Tensor | None = None
         self._device_maps: dict[torch.device,
-                                tuple[torch.Tensor, torch.Tensor]] = {}
+                                tuple[torch.Tensor, torch.Tensor,
+                                      torch.Tensor | None]] = {}
 
     def cold_routing(self, topk_ids: torch.Tensor,
                      cache_maps: bool = True) -> tuple[torch.Tensor,
                                                        torch.Tensor]:
-        global_to_local, local_to_cold_slot = self._maps_for(
+        global_to_local, local_to_cold_slot, global_to_cold_slot = self._maps_for(
             topk_ids.device, cache_maps)
+        if global_to_cold_slot is not None:
+            cold_slots = global_to_cold_slot[topk_ids.long()]
+            cold_mask = cold_slots >= 0
+            return cold_slots.masked_fill(~cold_mask, 0).to(
+                topk_ids.dtype), cold_mask
+
         local_ids, is_local = map_expert_ids(topk_ids, global_to_local)
         cold_slots = self._lookup_local_ids(local_ids, local_to_cold_slot)
 
@@ -55,13 +64,28 @@ class LayerRoutingMap:
         cold_topk_ids = cold_slots.masked_fill(~cold_mask, 0)
         return cold_topk_ids.to(topk_ids.dtype), cold_mask
 
+    def update_global_cold_experts(self, expert_ids: list[int]) -> None:
+        global_to_cold = torch.full((self.global_num_experts, ),
+                                    -1,
+                                    dtype=torch.long)
+        for slot, expert_id in enumerate(expert_ids):
+            if 0 <= expert_id < self.global_num_experts:
+                global_to_cold[expert_id] = slot
+        self.global_to_cold_slot = global_to_cold
+        self._device_maps.clear()
+
     def _maps_for(self, device: torch.device,
-                  cache_maps: bool) -> tuple[torch.Tensor, torch.Tensor]:
+                  cache_maps: bool) -> tuple[torch.Tensor, torch.Tensor,
+                                             torch.Tensor | None]:
         maps = self._device_maps.get(device)
         if maps is None:
+            global_to_cold_slot = (
+                None if self.global_to_cold_slot is None else
+                self.global_to_cold_slot.to(device=device, non_blocking=True))
             maps = (
                 self.global_to_local.to(device=device, non_blocking=True),
                 self.local_to_cold_slot.to(device=device, non_blocking=True),
+                global_to_cold_slot,
             )
             if cache_maps:
                 self._device_maps[device] = maps
