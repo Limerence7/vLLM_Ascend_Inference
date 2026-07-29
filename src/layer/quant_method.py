@@ -11,7 +11,7 @@ from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.quantization.quant_config import AscendFusedMoEMethod
 from vllm_ascend.quantization.w8a8_dynamic import \
-    AscendW8A8DynamicFusedMoEMethod
+    AscendW8A8DynamicFusedMoEMethod, scale_from_float_to_int64
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                maybe_trans_nz)
 
@@ -28,7 +28,7 @@ class RuntimeFusedMoEMethod:
                        experts: torch.nn.Module, hidden_states: torch.Tensor,
                        topk_weights: torch.Tensor, topk_ids: torch.Tensor,
                        global_num_experts: int,
-                       expert_map: torch.Tensor | None,
+                       expert_map: torch.Tensor,
                        log2phy: torch.Tensor | None,
                        global_redundant_expert_num: int,
                        shared_experts: Any | None,
@@ -77,6 +77,13 @@ class RuntimeFusedMoEMethod:
         return output
 
     @staticmethod
+    def _slot_to_global(layer, cold: bool) -> torch.Tensor:
+        expert_map, hot_count = layer.runtime_core.layout(layer)
+        expert_ids = (expert_map[hot_count:]
+                      if cold else expert_map[:hot_count])
+        return torch.tensor(expert_ids, dtype=torch.long)
+
+    @staticmethod
     def _unwrap_result(result):
         return result[0] if isinstance(result, tuple) else result
 
@@ -103,7 +110,8 @@ class RuntimeFusedMoEMethod:
 
         cold_output = self._run_experts(
             layer, moe_comm_method, cold_experts, cold_routing,
-            cold_experts.num_experts, None, None, 0, None,
+            cold_experts.num_experts,
+            None, None, 0, None,
             apply_router_weight_on_input, dynamic_eplb,
             select_optional_rows(mc2_mask, cold_routing.row_indices,
                                  num_rows),
@@ -112,7 +120,7 @@ class RuntimeFusedMoEMethod:
         if layer.runtime_core.collect_load:
             cold_output = self._record_and_unwrap(
                 layer, cold_output,
-                layer.runtime_core.cold_slot_to_global(layer))
+                self._slot_to_global(layer, cold=True))
         else:
             cold_output = self._unwrap_result(cold_output)
         return cold_routing, cold_output
@@ -152,7 +160,8 @@ class RuntimeFusedMoEMethod:
         if hot_routing is not None:
             hot_output = self._run_experts(
                 layer, moe_comm_method, layer, hot_routing,
-                layer.resident_local_num_experts, None, None, 0,
+                layer.local_num_experts,
+                None, None, 0,
                 shared_experts, apply_router_weight_on_input,
                 dynamic_eplb,
                 select_optional_rows(mc2_mask, hot_routing.row_indices,
@@ -162,7 +171,7 @@ class RuntimeFusedMoEMethod:
             if layer.runtime_core.collect_load:
                 hot_output = self._record_and_unwrap(
                     layer, hot_output,
-                    layer.runtime_core.resident_slot_to_global(layer))
+                    self._slot_to_global(layer, cold=False))
             else:
                 hot_output = self._unwrap_result(hot_output)
             add_routing_output(output, hot_routing, hot_output)
@@ -179,6 +188,7 @@ class RuntimeFusedMoEMethod:
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
+              expert_map: torch.Tensor,
               use_grouped_topk: bool,
               top_k: int,
               router_logits: torch.Tensor,
@@ -190,7 +200,6 @@ class RuntimeFusedMoEMethod:
               routed_scaling_factor: float = 1.0,
               e_score_correction_bias: torch.Tensor | None = None,
               global_num_experts: int = -1,
-              expert_map: torch.Tensor | None = None,
               apply_router_weight_on_input: bool = False,
               enable_force_load_balance: bool = False,
               shared_experts: Any | None = None,
@@ -224,9 +233,9 @@ class RuntimeFusedMoEMethod:
         global_redundant_expert_num = int(
             kwargs.get("global_redundant_expert_num", 0))
 
-        if not layer.runtime_config.uses_cold_buffer:
+        if not layer.runtime_core.uses_cold_buffer_for(layer):
             collect_load = (
-                layer.runtime_config.runtime_mode == "profile"
+                layer.runtime_core.config.runtime_mode == "profile"
                 or layer.runtime_core.collect_load)
             return self._fused_experts(
                 layer=layer,
@@ -248,7 +257,7 @@ class RuntimeFusedMoEMethod:
 
         prepared_cold_experts = layer.runtime_core.prepare_cold_experts(
             layer, topk_ids)
-        if layer.resident_local_num_experts == 0:
+        if layer.local_num_experts == 0:
             return self._apply_cold_only(
                 layer, moe_comm_method, x, topk_weights,
                 prepared_cold_experts.experts, prepared_cold_experts.topk_ids,
@@ -278,7 +287,7 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
             if get_ascend_device_type() != AscendDeviceType._310P:
                 getattr(layer, name).data = maybe_trans_nz(
                     getattr(layer, name).data)
-        if layer.runtime_config.runtime_mode in ("offload", "balance"):
+        if layer.runtime_core.config.runtime_mode in ("offload", "balance"):
             layer.runtime_core.process_layer_after_loading(layer, self)
 
     def process_offloaded_weights(self,
@@ -337,10 +346,10 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
 
     def process_weights_after_loading(self, layer):
         self.base_method.process_weights_after_loading(layer)
-        if layer.runtime_config.runtime_mode == "balance":
+        if layer.runtime_core.config.runtime_mode == "balance":
             self._prepare_weight_lists(layer)
             layer.runtime_core.process_layer_after_loading(layer, self)
-        elif layer.runtime_config.runtime_mode == "offload":
+        elif layer.runtime_core.config.runtime_mode == "offload":
             layer.runtime_core.process_layer_after_loading(layer, self)
             self._prepare_weight_lists(layer)
 
@@ -360,22 +369,24 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                        shared_experts, apply_router_weight_on_input,
                        dynamic_eplb, mc2_mask, pertoken_scale):
         context = get_forward_context()
-        w1 = self._tensor_list(experts, "w13_weight_list", "w13_weight")
-        w1_scale = self._tensor_list(
-            experts, "w13_weight_scale_fp32_list", "w13_weight_scale_fp32")
-        w2 = self._tensor_list(experts, "w2_weight_list", "w2_weight")
+        fused_mc2 = context.moe_comm_type == MoECommType.FUSED_MC2
+        w1 = self._weight_arg(experts, "w13_weight_list", "w13_weight",
+                              fused_mc2)
+        w2 = self._weight_arg(experts, "w2_weight_list", "w2_weight",
+                              fused_mc2)
         w2_scale_name = (
             "w2_weight_scale_fp32"
-            if context.moe_comm_type == MoECommType.FUSED_MC2
-            and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2 else
+            if fused_mc2 and envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2 else
             "w2_weight_scale")
         w2_scale_list_name = (
             "w2_weight_scale_fp32_list"
             if w2_scale_name == "w2_weight_scale_fp32" else
             "w2_weight_scale_list")
-        w2_scale = self._tensor_list(experts, w2_scale_list_name,
-                                     w2_scale_name)
-        local_num_experts = len(w1)
+        w1_scale = self._scale_arg(experts, "w13_weight_scale_fp32_list",
+                                   "w13_weight_scale_fp32", fused_mc2)
+        w2_scale = self._scale_arg(experts, w2_scale_list_name,
+                                   w2_scale_name, fused_mc2)
+        local_num_experts = int(w1[0].shape[0]) if fused_mc2 else len(w1)
         eplb_kwargs = {}
         if log2phy is not None:
             eplb_kwargs = {
@@ -414,6 +425,41 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
             tensor_list = list(tensor.unbind(dim=0))
             setattr(experts, list_name, tensor_list)
             return tensor_list
+        return [tensor]
+
+    @classmethod
+    def _weight_arg(cls, experts, list_name: str, tensor_name: str,
+                    fused_mc2: bool) -> list:
+        if not fused_mc2:
+            return cls._tensor_list(experts, list_name, tensor_name)
+        tensor = getattr(experts, tensor_name, None)
+        if tensor is None:
+            tensor = torch.stack(list(getattr(experts, list_name)))
+        return [tensor]
+
+    @classmethod
+    def _scale_arg(cls, experts, list_name: str, tensor_name: str,
+                   fused_mc2: bool) -> list:
+        if not fused_mc2:
+            return cls._tensor_list(experts, list_name, tensor_name)
+
+        fused_name = {
+            "w13_weight_scale_fp32": "fused_w1_scale",
+            "w13_weight_scale": "fused_w1_scale",
+            "w2_weight_scale_fp32": "fused_w2_scale",
+            "w2_weight_scale": "fused_w2_scale",
+        }.get(tensor_name)
+        fused_scale = (
+            getattr(experts, fused_name, None)
+            if fused_name is not None else None)
+        if fused_scale is not None:
+            return [fused_scale]
+
+        tensor = getattr(experts, tensor_name, None)
+        if tensor is None:
+            tensor = torch.stack(list(getattr(experts, list_name)))
+        if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+            tensor = scale_from_float_to_int64(tensor)
         return [tensor]
 
     @staticmethod

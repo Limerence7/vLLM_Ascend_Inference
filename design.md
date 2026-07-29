@@ -7,18 +7,19 @@
 Runtime 面向三类互斥运行模式：
 
 * `profile`：专家负载统计模式。模型保持原生 vLLM-Ascend MoE 计算路径，仅记录专家访问频率、激活 token 数和负载变化，不调整专家映射，不执行 CPU/NPU 参数传输。
-* `offload`：专家部分卸载模式。NPU 只保留一部分运行时专家和 cold buffer，CPU 保存该层全部 cold experts，通过运行时换入换出减少 NPU 常驻专家显存。
-* `balance`：专家负载均衡模式。CPU 保存该层全部专家，Runtime 根据全局负载动态调整 NPU 上的常驻专家分布，可使用冗余专家实现全局负载均衡。
+* `offload`：专家部分卸载模式。NPU 只保留一部分运行时专家和 cold buffer，CPU 保存本 rank cold experts，通过运行时换入换出减少 NPU 常驻专家显存。
+* `balance`：专家负载均衡模式。Runtime 根据全局负载动态调整 NPU 上的常驻专家分布，可使用冗余专家实现全局负载均衡。
 
 核心原则：
 
 * `runtime_mode` 只允许为 `profile`、`offload`、`balance`。
 * `num_hot_experts` 统一改名为 `num_runtime_experts`，该参数决定 Runtime 专家布局和执行语义。
-* `num_runtime_experts < 0` 表示单卡专家卸载数量，CPU 只保存全部 cold experts，运行时只调整 cold buffer。
+* `num_runtime_experts < 0` 表示每卡减少的 NPU 常驻专家数量，并创建对应 cold buffer。
 * `num_runtime_experts = 0` 表示不对专家进行卸载或冗余，等价于保持原生专家常驻布局。
-* `num_runtime_experts > 0` 表示使用冗余专家，CPU 保存该层全部专家，Runtime 可调整 NPU 常驻专家参数。
+* `num_runtime_experts > 0` 表示使用冗余专家，Runtime 可调整 NPU 常驻专家参数。
 * `OffloadFusedMoE` 只负责模型层接管、权重创建和调用 Runtime Core，不直接持有 executor、memory manager 或 balance adaptor 的策略逻辑。
 * `runtime_core` 是 Runtime 执行中枢，负责创建并协调 `exo_executor`、`memory_manager` 和 `lbvc_adaptor`。
+* `transfer_planner` 负责 balance 专家替换规划和 HCCL 卡间互传。
 * `moeload/profiler.py` 只负责专家负载统计，`moeload/policy.py` 只负责根据负载计算专家映射策略。
 * 专家访问统一通过 `logical_expert_id -> physical_slot_id` 映射完成。
 * NPU 专家显存布局在初始化和 `create_weights` 阶段确定，运行时只更新 slot 内容和映射快照，不动态修改模型结构。
@@ -42,6 +43,7 @@ vLLM_Ascend_Inference/
 │   │   ├── runtime_core.py
 │   │   ├── exo_executor.py
 │   │   ├── memory_manager.py
+│   │   ├── transfer_planner.py
 │   │   └── lbvc_adaptor.py
 │   ├── moeload/
 │   │   ├── __init__.py
@@ -53,7 +55,13 @@ vLLM_Ascend_Inference/
 └── tests/
     ├── only_run.py
     ├── naive_run.py
-    └── runtime_run.py
+    ├── runtime_run.py
+    ├── test_profiler.py
+    ├── test_policy.py
+    ├── test_lbvc_adaptor.py
+    ├── test_exo_executor.py
+    ├── test_transfer_planner.py
+    └── test_runtime_config.py
 ```
 
 目录职责：
@@ -62,7 +70,7 @@ vLLM_Ascend_Inference/
 * `src/model.py`：模型接管入口，按配置选择需要替换的 MoE 层；`profile` 模式下保持原生专家计算路径并接入 profiler。
 * `src/runtime_config.py`：统一配置定义和校验，覆盖模式选择、接管层、CPU memory、profiler、policy 和 `num_runtime_experts` 参数。
 * `src/layer/`：Runtime FusedMoE 计算层，负责权重创建、通信、routing view 构造和 MoE MLP 计算。
-* `src/runtime/`：运行时执行层，只保留 `runtime_core`、`exo_executor`、`memory_manager` 和 `lbvc_adaptor` 四个核心文件。
+* `src/runtime/`：运行时执行层，包含 `runtime_core`、`exo_executor`、`memory_manager`、`lbvc_adaptor` 和 `transfer_planner`。
 * `src/moeload/`：专家负载统计和策略模块，包含 profiler 与 policy。
 * `src/roofline/`：性能建模与策略评估预留模块，不参与初版主运行路径。
 * `tests/`：插件注册、原生基准和 Runtime 模式的统一测试入口。
@@ -92,9 +100,9 @@ vLLM_Ascend_Inference/
 
 `num_runtime_experts` 语义：
 
-* `< 0`：单卡卸载专家数量。每卡从 NPU 常驻专家中卸载 `abs(num_runtime_experts)` 个专家，CPU 保存这些 cold experts，NPU 创建对应 cold buffer。
+* `< 0`：每卡减少 `abs(num_runtime_experts)` 个 NPU 常驻 experts，并创建对应 cold buffer。
 * `= 0`：不进行专家卸载或冗余，NPU 专家布局与原生实现一致。
-* `> 0`：冗余专家数量。NPU 在原生常驻专家 slot 之外创建冗余 slot，CPU 保存该层全部专家，用于全局负载均衡。
+* `> 0`：冗余专家数量。NPU 在原生常驻专家 slot 之外创建冗余 slot，用于全局负载均衡。
 
 Profiler 与策略参数：
 
@@ -105,8 +113,7 @@ Profiler 与策略参数：
 
 Balance 参数：
 
-* `global_balance`：是否使用全局负载均衡。`balance` 模式下应默认开启。
-* `share_all_cpu_experts`：是否在 CPU 侧保存该层全部专家并供多进程共享。`balance` 模式下应默认开启。
+Balance 专家权重只通过 HCCL 在 rank 间互传；CPU-NPU 仅用于固定 cold experts。
 
 ## 5. 核心抽象
 
@@ -121,7 +128,7 @@ Balance 参数：
 * 在权重加载阶段接收 `OffloadFusedMoE` 拦截到的专家权重，并转交给 `MemoryManager` 管理。
 * 在 forward 阶段接收 profiler 统计结果、当前 token routing 信息和 layer/rank 信息。
 * 调用 `LBVCAdaptor` 生成或更新专家映射任务。
-* 调用 `ExoExecutor` 执行 CPU 到 NPU 的专家参数传输。
+* 调用 `TransferPlanner` 执行 balance 的 HCCL 卡间互传，或调用 `ExoExecutor` 加载固定 cold experts。
 * 向 routing 层提供当前稳定的 `logical_expert_id -> physical_slot_id` 映射快照。
 
 `OffloadFusedMoE` 不直接调度专家换入换出，也不直接制定负载均衡策略。
@@ -135,20 +142,28 @@ Balance 参数：
 * 保存 CPU 专家权重、shape、dtype、量化 scale/offset 等元数据。
 * 管理 CPU pinned memory 选项。
 * 管理 NPU 上由 `create_weights` 创建出的可更新 expert slots。
-* 在 `offload` 且 `num_runtime_experts < 0` 时，CPU 只保存全部 cold experts，NPU 只调整 cold buffer。
-* 在 `balance` 且 `num_runtime_experts > 0` 时，CPU 保存该层全部专家，并支持多进程共享访问。
+* 在 `offload` 且 `num_runtime_experts < 0` 时，CPU 只保存本 rank cold experts，NPU 只调整 cold buffer。
+* CPU 只保存固定 cold experts，不参与 balance 专家重分布。
 * 提供从 CPU expert 到 NPU physical slot 的加载描述，不直接执行传输。
 
 ### `ExoExecutor`
 
-`runtime/exo_executor.py` 负责专家参数传输。
+`runtime/exo_executor.py` 只负责固定 cold experts 的 CPU-NPU 传输。
 
 职责：
 
-* 接收 `LBVCAdaptor` 整合后的加载任务。
-* 执行 CPU 到 NPU 的 expert slot 参数传输。
+* 执行 CPU-NPU expert slot 参数传输。
 * 支持独立 NPU stream、event 同步和必要的流水线加载。
-* 对上层隐藏具体传输细节，只暴露任务提交和同步接口。
+
+### `TransferPlanner`
+
+`runtime/transfer_planner.py` 负责专家替换路径选择。
+
+职责：
+
+* 保持仍驻留本 rank 的专家物理 slot 不变。
+* 为迁入专家生成 HCCL P2P 任务并执行卡间互传。
+* 权重传输完成后由 `LBVCAdaptor` 发布新的 expert map。
 
 ### `LBVCAdaptor`
 
@@ -159,9 +174,11 @@ Balance 参数：
 * 从 profiler 或历史记录获得专家负载信息。
 * 调用 `moeload/policy.py` 计算专家映射。
 * 把 expert map 转换为 NPU slot 更新任务。
-* 将传输任务提交给 `ExoExecutor`。
+* 将 balance 目标映射交给 `TransferPlanner` 执行 HCCL 互传。
 * 更新 routing 所需的映射快照。
 * 在 `enable_history_mapping = True` 时主动发起初始化映射任务，调用 policy 生成 expert map，并驱动 Runtime 初始化专家分布。
+* `balance < 0` 时只调整 resident 热专家，cold experts 始终固定。
+* `balance >= 0` 时对全部 NPU experts 做全局负载均衡。
 
 ### `Profiler`
 
@@ -174,6 +191,8 @@ Balance 参数：
 * 短期和历史负载变化。
 
 Profiler 只记录和输出负载，不决定专家映射。
+
+Profiler 统计在设备侧累加，避免 forward 每步同步到 CPU；保存历史或读取 delta 时才同步。
 
 ### `Policy`
 
@@ -202,7 +221,7 @@ Profiler 只记录和输出负载，不决定专家映射。
 不同配置下的权重布局：
 
 * `runtime_mode = profile`：保持原生专家布局和原生计算路径，只记录专家负载。
-* `num_runtime_experts < 0`：NPU 创建减少后的常驻专家 slots 和 cold buffer slots，CPU 保存 cold experts。
+* `num_runtime_experts < 0`：NPU 创建减少后的常驻专家 slots 和 cold buffer slots。
 * `num_runtime_experts = 0`：NPU 创建原生本地专家 slots，不启用专家迁移。
 * `num_runtime_experts > 0`：NPU 创建原生本地专家 slots 和 redundant slots，CPU 保存该层全部 experts。
 
@@ -245,7 +264,7 @@ Profiler 只记录和输出负载，不决定专家映射。
 
 1. `runtime_mode = profile`。
 2. Runtime 接管目标 MoE 层，但 `create_weights` 和 forward 计算保持原生本地专家布局。
-3. Forward 过程中通过 profiler 记录每层、每个 expert 的 token 负载。
+3. Forward 过程中通过 profiler 在设备侧记录每层、每个 expert 的 token 负载。
 4. 不创建 CPU expert storage。
 5. 不调整专家映射，不执行专家参数传输。
 
@@ -260,7 +279,7 @@ Profiler 只记录和输出负载，不决定专家映射。
 
 1. 初始化阶段根据 `num_runtime_experts` 计算每卡需要卸载的 cold experts。
 2. `create_weights` 创建 NPU 常驻 experts 和 cold buffer slots。
-3. `RuntimeCore` 将专家权重交给 `MemoryManager`，CPU 只保存全部 cold experts。
+3. `RuntimeCore` 将专家权重交给 `MemoryManager`，CPU 只保存本 rank cold experts。
 4. 如果 `enable_history_mapping = True`，`LBVCAdaptor` 读取历史负载并调用 `Policy` 生成初始 expert map。
 5. Forward dispatch 后，profiler 统计当前 expert token 负载。
 6. `LBVCAdaptor` 根据当前负载或历史策略计算 cold buffer 更新任务。
@@ -275,21 +294,27 @@ Offload 模式只调整 cold buffer，不调整全部 NPU 常驻专家布局。
 适用条件：
 
 * `runtime_mode = balance`。
-* 主要使用 `num_runtime_experts > 0` 表示冗余专家数量。
+* `num_runtime_experts < 0`、`= 0` 或 `> 0` 分别表示 cold buffer、原生 slot 数和 redundant slots。
 
 流程：
 
 1. 初始化阶段建立全局 rank/layer/expert 视图。
-2. CPU 侧保存该层全部专家，并支持各进程之间共享。
-3. `create_weights` 创建原生常驻 expert slots 和 redundant expert slots。
+2. CPU 侧仅在存在 cold buffer 时保存固定 cold experts。
+3. `create_weights` 根据 `num_runtime_experts` 创建 resident、cold buffer 或 redundant slots。
 4. 如果 `enable_history_mapping = True`，`LBVCAdaptor` 主动发起初始化映射任务。
 5. `LBVCAdaptor` 将历史负载或当前全局负载传给 `Policy`。
-6. `Policy` 计算全局 expert map，决定哪些专家应常驻或冗余到哪些 NPU slots。
-7. `LBVCAdaptor` 将 expert map 转换为参数加载任务。
-8. `ExoExecutor` 从共享 CPU expert storage 向目标 NPU slots 传输专家参数。
+6. `Policy` 计算全局 expert map，决定哪些专家应进入 resident、cold buffer 或 redundant slots。
+7. `LBVCAdaptor` 将 expert map 交给 `TransferPlanner`，通过 HCCL 完成迁入专家互传。
+8. `ExoExecutor` 不参与 balance 权重迁移。
 9. `RuntimeCore` 更新 routing 映射快照，后续 token 根据新的全局映射进行计算。
 
 Balance 模式不再局限于 pair 内对端专家副本，而是以全局负载为输入，直接调整 NPU 上由 `create_weights` 创建出的常驻专家参数和冗余专家参数，实现真正的全局负载均衡。
+
+不同 `num_runtime_experts` 的传输语义：
+
+* `< 0`：resident 热专家调换走 HCCL，cold buffer 专家保持固定并从 CPU 加载。
+* `= 0`：原生数量的 slots 参与全局均衡，迁入专家走 HCCL。
+* `> 0`：redundant slots 用于热点专家副本，迁入专家走 HCCL。
 
 ## 8. 历史映射初始化
 
@@ -300,13 +325,13 @@ Balance 模式不再局限于 pair 内对端专家副本，而是以全局负载
 3. `LBVCAdaptor` 将历史负载、当前 rank 信息、layer 信息、NPU slot 信息和 `num_runtime_experts` 传给 `Policy`。
 4. `Policy` 返回初始化 expert map。
 5. `LBVCAdaptor` 将 expert map 转换为加载任务，并交给 `ExoExecutor`。
-6. `ExoExecutor` 完成 CPU 到 NPU 的参数传输。
+6. `TransferPlanner` 完成 balance 的 HCCL 互传；`ExoExecutor` 仅完成固定 cold experts 的 CPU-NPU 加载。
 7. `RuntimeCore` 发布初始化后的 routing 映射快照。
 
 该流程适用于 `offload` 和 `balance`，但语义不同：
 
 * `offload`：初始化 cold buffer 的专家分布。
-* `balance`：初始化全局常驻专家和冗余专家分布。
+* `balance`：初始化全局 resident、cold buffer 或 redundant expert 分布。
 
 ## 9. Roofline 与策略评估
 
@@ -329,3 +354,9 @@ Balance 模式不再局限于 pair 内对端专家副本，而是以全局负载
 * `tests/only_run.py`：验证插件注册、配置解析、模型加载和 `profile` smoke test。
 * `tests/naive_run.py`：运行原生 vLLM-Ascend 推理基准，作为正确性和性能对照。
 * `tests/runtime_run.py`：统一验证 Runtime 模式，覆盖 `offload` 的 cold buffer 加载和 `balance` 的全局 profiler/policy/adaptor/routing 流程。
+* `tests/test_profiler.py`：验证 profiler 设备侧统计和历史保存行为。
+* `tests/test_policy.py`：验证全局专家分布策略。
+* `tests/test_lbvc_adaptor.py`：验证 balance/offload 的 slot 更新策略。
+* `tests/test_exo_executor.py`：验证固定 cold experts 的 CPU-NPU 加载语义。
+* `tests/test_transfer_planner.py`：验证 CPU/HCCL/local NPU 传输任务规划。
+* `tests/test_runtime_config.py`：验证 Runtime 配置校验。

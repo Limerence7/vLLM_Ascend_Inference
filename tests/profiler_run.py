@@ -1,29 +1,35 @@
+
 import sys
 import os
+import gc
 import json
 import pandas as pd
 import csv
-import random
-import math
-
+import time
+import torch
+import torch_npu
+from pathlib import Path
 from vllm import LLM, SamplingParams
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+PROFILE_DIR = ROOT_DIR / "load_records" / "vllm_profile"
 
 Inference_Config = {
     "Qwen3-30B-A3B": {
         "model_path": "/workspace/models/Qwen3-30B-A3B",
-        "batch_size": 1024,
+        "batch_size": 256,
         "max_length": 2048,
-        "max_new_tokens": 512,
-        "world_size": 2,
+        "max_new_tokens": 128,
+        "world_size": 4,
         "utilization": 0.85,
     },
     "Qwen3-235B-A22B": {
         "model_path": "/workspace/models/Qwen3-235B-A22B",
         "batch_size": 512,
-        "max_length": 1024,
-        "max_new_tokens": 512,
+        "max_length": 32,
+        "max_new_tokens": 32,
         "world_size": 8,
-        "utilization": 0.98,
+        "utilization": 0.9,
     },
     "Qwen3-235B-A22B-W8A8": {
         "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
@@ -35,7 +41,7 @@ Inference_Config = {
     },
 }
 
-current_config = Inference_Config["Qwen3-235B-A22B"]
+current_config = Inference_Config["Qwen3-30B-A3B"]
 
 def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):
     text = ""
@@ -68,6 +74,40 @@ def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):
         
     return contents
 
+def run_warmup(llm, batch_user_inputs, sampling_params):
+    warmup_prompts = batch_user_inputs[:min(4, len(batch_user_inputs))]
+    llm.generate(
+        warmup_prompts, 
+        sampling_params=sampling_params,
+        use_tqdm=False,
+    )
+    print("Warmup completed.")
+    
+def run_profile(llm, batch_user_inputs, sampling_params):
+    print(f"Starting worker profiling: {PROFILE_DIR}")
+    llm.start_profile()
+
+    try:
+        outputs = llm.generate(
+            batch_user_inputs,
+            sampling_params,
+            use_tqdm=True,
+        )
+    finally:
+        torch.npu.synchronize()
+        # 必须执行 stop_profile
+        llm.stop_profile()
+
+    print("Worker profiling completed.")
+    return outputs
+
+def shutdown_llm(llm):
+    try:
+        llm.llm_engine.engine_core.shutdown()
+    finally:
+        del llm
+        gc.collect()
+
 if __name__ == "__main__":
     
     print("Loading model...")
@@ -88,6 +128,16 @@ if __name__ == "__main__":
         dtype="bfloat16",
         # quantization='ascend',
         enforce_eager=True,
+        profiler_config={
+            "profiler": "torch",
+            "torch_profiler_dir": str(PROFILE_DIR),
+
+            "torch_profiler_record_shapes": False,
+            "torch_profiler_with_memory": False,
+            "torch_profiler_with_stack": False,
+            "torch_profiler_with_flops": False,
+            "torch_profiler_use_gzip": False,
+        },
     )
 
     tokenizer = llm.get_tokenizer()
@@ -112,12 +162,15 @@ if __name__ == "__main__":
         encoded["input_ids"],
         skip_special_tokens=True,
     )
-
-    outputs = llm.generate(batch_user_inputs, sampling_params)
-
-    for output in outputs:
-        prompt = output.prompt
-        response = output.outputs[0].text
-        print(f"Response is:\n {response}\n")
-        break
+    try:
+        run_warmup(llm, batch_user_inputs, sampling_params)
+        
+        outputs = run_profile(llm, batch_user_inputs, sampling_params)
+        for output in outputs:
+            prompt = output.prompt
+            response = output.outputs[0].text
+            print(f"Response is:\n {response}\n")
+            break
+    except Exception as e:  
+        print(f"Error during profiling: {e}")
 

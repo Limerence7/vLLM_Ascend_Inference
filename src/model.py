@@ -18,7 +18,6 @@ def _layer_id_from_prefix(prefix: str) -> int:
     match = LAYER_ID_PATTERN.search(prefix)
     return int(match.group(1))
 
-
 class DynamicFusedMoE(AscendFusedMoE):
     """Select the native or runtime MoE implementation for each layer."""
 
@@ -30,7 +29,6 @@ class DynamicFusedMoE(AscendFusedMoE):
         return moe_cls(*args, **kwargs)
 
     make_expert_params_mapping = AscendFusedMoE.make_expert_params_mapping
-
 
 class RuntimeQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
     """Qwen3 MoE wrapper that installs the runtime MoE backend."""

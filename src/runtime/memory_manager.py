@@ -186,9 +186,6 @@ class CpuExpertWeights:
     def __init__(self, layer, expert_ids: list[int], cpu_pin_memory: bool,
                  shared_factory: SharedTensorFactory | None = None):
         self.layer_id = int(layer.moe_instance_id)
-        self.tp_rank = int(layer.tp_rank)
-        self.shared_factory = shared_factory
-        self.expert_ids = expert_ids
         self.expert_id_to_slot = {
             expert_id: slot
             for slot, expert_id in enumerate(expert_ids)
@@ -197,18 +194,20 @@ class CpuExpertWeights:
             name: self._empty_cpu_like(getattr(layer, name),
                                        len(expert_ids),
                                        cpu_pin_memory,
-                                       name)
+                                       name,
+                                       int(layer.tp_rank),
+                                       shared_factory)
             for name in self.PARAM_NAMES
             if hasattr(layer, name)
         }
 
-    def load_shard(self, param_name: str, local_expert_id: int,
+    def load_shard(self, param_name: str, global_expert_id: int,
                    shard_id: str, loaded_weight: torch.Tensor,
                    tp_rank: int) -> bool:
         if param_name not in self.tensors:
             return False
 
-        slot = self.expert_id_to_slot[local_expert_id]
+        slot = self._row(global_expert_id)
         expert_data = self.tensors[param_name][slot]
 
         if param_name.startswith("w2_") and shard_id == "w2":
@@ -240,11 +239,10 @@ class CpuExpertWeights:
     def get_weights(self,
                     expert_ids: list[int] | None = None
                     ) -> dict[str, torch.Tensor]:
-        if expert_ids is None or expert_ids == self.expert_ids:
+        if expert_ids is None:
             return self.tensors
 
-        slots = [self.expert_id_to_slot[expert_id]
-                 for expert_id in expert_ids]
+        slots = [self._row(expert_id) for expert_id in expert_ids]
         slot_tensor = torch.tensor(slots, dtype=torch.long, device="cpu")
         return {
             name: tensor.index_select(0, slot_tensor)
@@ -253,8 +251,15 @@ class CpuExpertWeights:
 
     def copy_to_module(self, expert_ids: list[int], module,
                        target_slots: list[int]) -> None:
+        if len(expert_ids) != len(target_slots):
+            raise ValueError(
+                "expert_ids and target_slots must have the same length.")
         for expert_id, target_slot in zip(expert_ids, target_slots):
-            source_slot = self.expert_id_to_slot[expert_id]
+            if not 0 <= target_slot < int(module.local_num_experts):
+                raise ValueError(
+                    f"Target slot {target_slot} is out of range for layer "
+                    f"{self.layer_id}.")
+            source_slot = self._row(expert_id)
             for name, tensor in self.tensors.items():
                 self._copy_tensor(module, name, target_slot,
                                   tensor[source_slot])
@@ -278,20 +283,30 @@ class CpuExpertWeights:
         getattr(module, list_name)[target_slot].copy_(source,
                                                       non_blocking=True)
 
+    def _row(self, expert_id: int) -> int:
+        try:
+            return self.expert_id_to_slot[expert_id]
+        except KeyError as error:
+            raise ValueError(
+                f"Expert {expert_id} is not stored for layer "
+                f"{self.layer_id}.") from error
+
     def _empty_cpu_like(
         self,
         template_tensor: torch.Tensor,
         num_experts: int,
         cpu_pin_memory: bool,
         name: str,
+        tp_rank: int,
+        shared_factory: SharedTensorFactory | None,
     ) -> torch.Tensor:
         shape = (num_experts, *template_tensor.shape[1:])
-        if self.shared_factory is not None:
-            key = self.shared_factory.tensor_key(
-                self.layer_id, self.tp_rank, name, shape,
+        if shared_factory is not None:
+            key = shared_factory.tensor_key(
+                self.layer_id, tp_rank, name, shape,
                 template_tensor.dtype)
-            return self.shared_factory.empty(key, shape,
-                                             template_tensor.dtype).contiguous()
+            return shared_factory.empty(
+                key, shape, template_tensor.dtype).contiguous()
 
         cpu_tensor = torch.empty(shape,
                                  dtype=template_tensor.dtype,
@@ -301,7 +316,7 @@ class CpuExpertWeights:
         return cpu_tensor.contiguous()
 
 
-class ExpertMemoryManager(nn.Module):
+class ExpertMemoryManager:
     """Stores expert weights as contiguous per-layer CPU tensors."""
 
     def __init__(
@@ -311,7 +326,6 @@ class ExpertMemoryManager(nn.Module):
         shared_cpu_expert_dir: str = "/dev/shm/vllm_ascend_runtime",
         shared_cpu_expert_name: str | None = None,
     ):
-        super().__init__()
         self.cpu_pin_memory = cpu_pin_memory
         self.shared_factory = (
             SharedTensorFactory(shared_cpu_expert_dir,
@@ -321,6 +335,9 @@ class ExpertMemoryManager(nn.Module):
 
     def register_layer(self, layer_id: int, layer,
                        expert_ids: list[int]) -> None:
+        if len(expert_ids) != len(set(expert_ids)):
+            raise ValueError(
+                f"Layer {layer_id} contains duplicate CPU expert ids.")
         self.layers[layer_id] = CpuExpertWeights(
             layer=layer,
             expert_ids=expert_ids,
@@ -329,9 +346,9 @@ class ExpertMemoryManager(nn.Module):
         )
 
     def load_weight_shard(self, layer_id: int, param_name: str,
-                          local_expert_id: int, shard_id: str,
+                          global_expert_id: int, shard_id: str,
                           loaded_weight: torch.Tensor, tp_rank: int) -> bool:
-        return self.layers[layer_id].load_shard(param_name, local_expert_id,
+        return self.layers[layer_id].load_shard(param_name, global_expert_id,
                                                 shard_id, loaded_weight,
                                                 tp_rank)
 

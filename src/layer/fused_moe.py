@@ -17,11 +17,11 @@ from vllm.model_executor.layers.fused_moe.layer import (
     maybe_roundup_hidden_size)
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import determine_default_log2phy_map
 from vllm_ascend.eplb.utils import moe_load_async_stream
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
+from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.prepare_finalize import QuantType
 from vllm_ascend.quantization.w4a8_dynamic import \
     AscendW4A8DynamicFusedMoEMethod
@@ -31,11 +31,9 @@ from vllm_ascend.utils import npu_stream_switch
 
 from ..runtime_config import get_runtime_config
 from ..runtime.runtime_core import RuntimeCore
-from .moe_comm_method import setup_moe_comm_method
 from .quant_method import (RuntimeUnquantizedFusedMoEMethod,
                            RuntimeW8A8DynamicFusedMoEMethod,
                            wrap_quant_method)
-from .routing import ExpertPlacement, map_expert_ids
 
 
 EXPERT_WEIGHT_NAMES = (
@@ -57,7 +55,13 @@ class RuntimeAscendFusedMoE(FusedMoE):
         cls.moe_counter = -1
         cls.gate_stream = None
         RuntimeCore.reset()
-
+    '''
+    __init__ follows the same logic as FusedMoE, but with additional runtime attributes and
+    configurations for Ascend hardware and Runtime Features. So if making changes to the __init__ method,
+    please ensure that the changes are compatible with both FusedMoE and RuntimeAscendFusedMoE.
+    Naive __init__ implementation is needed at beginning, then add the runtime attributes and configurations
+    for Ascend hardware and Runtime Features.
+    '''
     def __init__(
         self,
         num_experts: int,
@@ -201,133 +205,36 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.batched_hidden_states = None
         self.batched_router_logits = None
 
+        # Runtime must know the quantization type before it creates shared
+        # executors, and it must adjust expert maps before weight creation.
         RuntimeAscendFusedMoE.moe_counter += 1
         self.moe_instance_id = RuntimeAscendFusedMoE.moe_counter
 
-        self._expert_map = None
-        self.full_expert_map = None
-        self.full_local_num_experts = 0
-        self.resident_local_num_experts = 0
-        self._resident_maps_by_device: dict[torch.device, torch.Tensor] = {}
-        self.log2phy = None
-
-        self.quant_method = (
-            RuntimeUnquantizedFusedMoEMethod(self.moe_config)
-            if self.quant_config is None else wrap_quant_method(
-                self.quant_config.get_quant_method(self, self.layer_name)))
-
+        self._init_runtime_attributes()
+        self.quant_method = self._get_runtime_quant_method()
         assert self.quant_method is not None
         self.uses_w8a8 = isinstance(self.quant_method,
                                     RuntimeW8A8DynamicFusedMoEMethod)
-        self.runtime_config = get_runtime_config()
-        self.runtime_core = RuntimeCore(self.runtime_config, self.uses_w8a8)
+        self.runtime_core = RuntimeCore(get_runtime_config(), self.uses_w8a8)
 
-        self.moe_config.tp_group = get_tp_group()
-        self.moe_config.dp_group = get_dp_group()
-        self.moe_config.ep_group = get_ep_group()
-        self.moe_config.mc2_group = get_mc2_group()
+        self._init_ascend_comm_groups()
         ascend_config = get_ascend_config()
-        self.dynamic_eplb = (
-            ascend_config.dynamic_eplb
-            or ascend_config.expert_map_record_path)
-        if self.runtime_config.runtime_mode == "balance":
-            self.dynamic_eplb = False
-            if self.uses_w8a8:
-                self.quant_method.disable_native_dynamic_eplb()
-        self.expert_map_path = ascend_config.expert_map_path
-        self.global_redundant_expert_num = ascend_config.init_redundancy_expert
-        self.global_num_experts = num_experts + self.global_redundant_expert_num
-        if self.runtime_config.runtime_mode == "balance":
-            self.global_redundant_expert_num = (
-                self.ep_size * self.runtime_config.redundant_count)
-            self.global_num_experts = (
-                num_experts + self.global_redundant_expert_num)
-        self.multistream_overlap_gate = False
-        if (self.custom_routing_function is None
-                and self.e_score_correction_bias is not None):
-            vllm_config = get_current_vllm_config()
-            self.e_score_correction_bias.data = self.e_score_correction_bias.data.to(
-                dtype=vllm_config.model_config.dtype)
-
-        if self.runtime_config.runtime_mode == "balance":
-            global_load = self.runtime_core.global_load_for_layer(self)
-            self.local_num_experts, self._expert_map, self.log2phy = (
-                self.runtime_core.initial_balance_maps(
-                    num_experts=num_experts,
-                    ep_size=self.ep_size,
-                    ep_rank=self.ep_rank,
-                    global_load=global_load,
-                ))
-            self.log2phy = self.log2phy.npu()
-        else:
-            self.local_num_experts, self._expert_map, _ = determine_expert_map(
-                self.ep_size, self.ep_rank, self.global_num_experts)
-        init_eplb_enable = False
-        if (self.runtime_config.runtime_mode != "balance"
-                and self.expert_map_path and os.path.exists(
-                self.expert_map_path) and os.access(self.expert_map_path,
-                                                    os.R_OK)):
-            self.expert_load_balancer = ExpertLoadBalancer(
-                self.expert_map_path, num_experts)
-            self.expert_load_balancer.check_expert_map_tensor()
-            self.global_redundant_expert_num = (
-                self.expert_load_balancer.get_global_redundant_expert_num())
-            self.global_num_experts = num_experts + self.global_redundant_expert_num
-            try:
-                self.local_num_experts, self._expert_map = (
-                    self.expert_load_balancer.get_rank_placement_map(
-                    self.moe_instance_id, self.ep_rank))
-                self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
-                    self.moe_instance_id, self.ep_rank).npu()
-                init_eplb_enable = True
-            except Exception as e:
-                logger.warning(
-                    f"Init expert map of mtp/eagle when using sample.{e}")
-                self.log2phy = determine_default_log2phy_map(
-                    self.global_num_experts, self.ep_size, self.ep_rank).npu()
-        elif self.runtime_config.runtime_mode != "balance" and self.dynamic_eplb:
-            self.log2phy = determine_default_log2phy_map(
-                self.global_num_experts, self.ep_size, self.ep_rank).npu()
-        self.full_expert_map = self._expert_map
-        self.full_local_num_experts = int(
-            torch.sum(self.full_expert_map != -1).item()
-            if self.full_expert_map is not None else self.global_num_experts)
-        self.resident_local_num_experts = self._resident_local_num_experts()
-        self.expert_placement = self._init_expert_placement()
-        self._expert_map = self._build_resident_expert_map()
-        self.local_num_experts = self.resident_local_num_experts
-
-        if self.full_expert_map is not None:
-            logger.info_once(
-                "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
-                " number of experts: %s/%s. Experts local to global index map:"
-                " %s.", self.ep_rank, self.ep_size, self.full_local_num_experts,
-                self.global_num_experts,
-                get_compressed_expert_map(self.full_expert_map))
-            if self.runtime_config.runtime_mode == "balance":
-                logger.info(
-                    "[Runtime Balance][EP Rank %s/%s] Layer %s uses %s "
-                    "redundant experts per rank. Local/global experts: "
-                    "%s/%s. Global redundant experts: %s.",
-                    self.ep_rank, self.ep_size, self.moe_instance_id,
-                    self.runtime_config.redundant_count,
-                    self.full_local_num_experts, self.global_num_experts,
-                    self.global_redundant_expert_num)
-        if self.dynamic_eplb:
-            self.moe_load = torch.zeros(self.resident_local_num_experts,
-                                        dtype=torch.int64).npu()
-        else:
-            self.moe_load = None
+        self._init_ascend_runtime_options(ascend_config, num_experts)
+        init_eplb_enable, initial_slots = self._init_expert_map(num_experts)
+        initial_expert_map, initial_lookup, full_count = (
+            self._apply_runtime_expert_layout(initial_slots))
+        self._log_expert_layout(initial_lookup, full_count)
+        self._init_moe_load()
 
         if init_eplb_enable and not self.uses_w8a8:
             raise ValueError("Eplb supports only w8a8_dynamic quantization.")
 
         self.moe_config.num_experts = self.global_num_experts
-        self.moe_config.num_local_experts = self.resident_local_num_experts
+        self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.original_num_experts = num_experts
 
         moe_quant_params = {
-            "num_experts": self.resident_local_num_experts,
+            "num_experts": self.local_num_experts,
             "hidden_size": self.hidden_size,
             "intermediate_size_per_partition":
             self.intermediate_size_per_partition,
@@ -339,81 +246,192 @@ class RuntimeAscendFusedMoE(FusedMoE):
                 in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod")):
             moe_quant_params["intermediate_size_full"] = intermediate_size
         self.quant_method.create_weights(layer=self, **moe_quant_params)
-        self.runtime_core.register_layer(self)
+        self.runtime_core.register_layer(self, initial_expert_map)
 
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
 
-        self.moe_config.num_local_experts = max(
-            1, self.resident_local_num_experts)
-        setup_moe_comm_method(self.moe_config)
-        self.moe_config.num_local_experts = self.resident_local_num_experts
+        self._setup_moe_comm_method()
         self.quant_type = self._get_quant_type()
 
-    def _init_expert_placement(self) -> ExpertPlacement:
-        if self.runtime_config.uses_cold_buffer:
-            return self.runtime_core.init_offload_placement(self)
-        return ExpertPlacement(list(range(self.full_local_num_experts)), [])
+    def _init_runtime_attributes(self) -> None:
+        self._expert_map = torch.empty(0, dtype=torch.int32)
+        self.log2phy = None
 
-    def _resident_local_num_experts(self) -> int:
-        if not self.runtime_config.uses_cold_buffer:
-            return self.full_local_num_experts
-        if not self.runtime_core.should_manage_layer(self):
-            return self.full_local_num_experts
-        return max(0,
-                   self.full_local_num_experts -
-                   int(self.runtime_config.offload_count))
+    def _get_runtime_quant_method(self):
+        if self.quant_config is None:
+            return RuntimeUnquantizedFusedMoEMethod(self.moe_config)
+        return wrap_quant_method(
+            self.quant_config.get_quant_method(self, self.layer_name))
 
-    def _build_resident_expert_map(self) -> torch.Tensor | None:
-        resident_ids = self.expert_placement.resident_expert_ids
-        if (self.resident_local_num_experts == self.full_local_num_experts
-                and resident_ids == list(range(self.full_local_num_experts))):
-            return self.full_expert_map
+    def _init_ascend_comm_groups(self) -> None:
+        self.moe_config.tp_group = get_tp_group()
+        self.moe_config.dp_group = get_dp_group()
+        self.moe_config.ep_group = get_ep_group()
+        self.moe_config.mc2_group = get_mc2_group()
 
+    def _init_ascend_runtime_options(self, ascend_config,
+                                     num_experts: int) -> None:
+        self.dynamic_eplb = (
+            ascend_config.dynamic_eplb
+            or ascend_config.expert_map_record_path)
+        if self.runtime_core.config.runtime_mode == "balance":
+            self.dynamic_eplb = False
+            if self.uses_w8a8:
+                self.quant_method.disable_native_dynamic_eplb()
+
+        self.expert_map_path = ascend_config.expert_map_path
+        self.global_redundant_expert_num = ascend_config.init_redundancy_expert
+        self.global_num_experts = num_experts + self.global_redundant_expert_num
+        if (self.runtime_core.config.runtime_mode == "balance"
+                and self.runtime_core.should_manage_layer(self)):
+            self.global_redundant_expert_num = (
+                self.ep_size * self.runtime_core.config.redundant_count)
+            self.global_num_experts = (
+                num_experts + self.global_redundant_expert_num)
+
+        self.multistream_overlap_gate = False
+        if (self.custom_routing_function is None
+                and self.e_score_correction_bias is not None):
+            self.e_score_correction_bias.data = (
+                self.e_score_correction_bias.data.to(
+                    dtype=self.vllm_config.model_config.dtype))
+
+    def _init_expert_map(self, num_experts: int) -> tuple[bool, list[int]]:
+        if (self.runtime_core.config.runtime_mode == "balance"
+                and self.runtime_core.should_manage_layer(self)):
+            return False, self._init_balance_expert_map(num_experts)
+
+        init_eplb_enable = self._init_native_eplb_map(num_experts)
+        if not init_eplb_enable:
+            self.local_num_experts, determined_map, _ = determine_expert_map(
+                self.ep_size, self.ep_rank, self.global_num_experts)
+            self._expert_map = (
+                torch.arange(self.global_num_experts, dtype=torch.int32)
+                if self.ep_size == 1 else determined_map)
+            if self.dynamic_eplb:
+                self.log2phy = determine_default_log2phy_map(
+                    self.global_num_experts, self.ep_size, self.ep_rank).npu()
+        return init_eplb_enable, []
+
+    def _init_balance_expert_map(self, num_experts: int) -> list[int]:
+        global_load = self.runtime_core.global_load_for_layer(self)
+        (self.local_num_experts, self._expert_map, self.log2phy,
+         slot_to_global) = (
+            self.runtime_core.initial_balance_maps(
+                num_experts=num_experts,
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_load=global_load,
+            ))
+        self.log2phy = self.log2phy.npu()
+        return slot_to_global
+
+    def _init_native_eplb_map(self, num_experts: int) -> bool:
+        if not (self.expert_map_path
+                and os.path.exists(self.expert_map_path)
+                and os.access(self.expert_map_path, os.R_OK)):
+            return False
+
+        self.expert_load_balancer = ExpertLoadBalancer(
+            self.expert_map_path, num_experts)
+        self.expert_load_balancer.check_expert_map_tensor()
+        self.global_redundant_expert_num = (
+            self.expert_load_balancer.get_global_redundant_expert_num())
+        self.global_num_experts = num_experts + self.global_redundant_expert_num
+        try:
+            self.local_num_experts, self._expert_map = (
+                self.expert_load_balancer.get_rank_placement_map(
+                    self.moe_instance_id, self.ep_rank))
+            self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
+                self.moe_instance_id, self.ep_rank).npu()
+            return True
+        except Exception as e:
+            logger.warning(
+                f"Init expert map of mtp/eagle when using sample.{e}")
+            self.log2phy = determine_default_log2phy_map(
+                self.global_num_experts, self.ep_size, self.ep_rank).npu()
+            return False
+
+    def _apply_runtime_expert_layout(
+            self, initial_slots: list[int]
+            ) -> tuple[list[int], torch.Tensor, int]:
+        initial_lookup = self._expert_map
+        full_count = int(self.local_num_experts)
+        expert_map = (list(initial_slots) if initial_slots else
+                      self._slot_experts(initial_lookup, full_count))
+        if self.runtime_core.uses_cold_buffer_for(self):
+            expert_map, hot_count = (
+                self.runtime_core.initial_offload_expert_map(
+                    self, expert_map))
+        else:
+            hot_count = len(expert_map)
+        if not 0 <= hot_count <= len(expert_map):
+            raise ValueError(
+                f"Invalid hot expert count {hot_count} for layer "
+                f"{self.moe_instance_id} with {len(expert_map)} slots.")
+        self.local_num_experts = hot_count
+        self._expert_map = self._build_expert_lookup(
+            expert_map[:hot_count])
+        return expert_map, initial_lookup, full_count
+
+    def _log_expert_layout(self,
+                           initial_lookup: torch.Tensor,
+                           full_count: int) -> None:
+        logger.info_once(
+            "[EP Rank %s/%s] Expert parallelism is enabled. Local/global"
+            " number of experts: %s/%s. Experts local to global index map:"
+            " %s.", self.ep_rank, self.ep_size, full_count,
+            self.global_num_experts,
+            get_compressed_expert_map(initial_lookup))
+        if self.runtime_core.config.runtime_mode != "balance":
+            return
+        logger.info(
+            "[Runtime Balance][EP Rank %s/%s] Layer %s uses %s "
+            "redundant experts per rank. Local/global experts: "
+            "%s/%s. Global redundant experts: %s.",
+            self.ep_rank, self.ep_size, self.moe_instance_id,
+            self.runtime_core.config.redundant_count,
+            full_count, self.global_num_experts,
+            self.global_redundant_expert_num)
+
+    def _init_moe_load(self) -> None:
+        self.moe_load = (
+            torch.zeros(self.local_num_experts, dtype=torch.int64)
+            if self.dynamic_eplb else None)
+
+    def _setup_moe_comm_method(self) -> None:
+        self.moe_config.num_local_experts = max(
+            1, self.local_num_experts)
+        setup_moe_comm_method(self.moe_config)
+        self.moe_config.num_local_experts = self.local_num_experts
+
+    def _build_expert_lookup(
+            self, slot_to_global: list[int]) -> torch.Tensor:
         expert_map = torch.full((self.global_num_experts, ),
                                 -1,
                                 dtype=torch.int32)
-        resident_slots = self.expert_placement.resident_slots
-        if self.full_expert_map is None:
-            for local_id, slot in resident_slots.items():
-                expert_map[local_id] = slot
-            return expert_map
-
-        full_map = self.full_expert_map.detach().cpu()
-        for global_id, local_id in enumerate(full_map.tolist()):
-            slot = resident_slots.get(int(local_id))
-            if slot is not None:
-                expert_map[global_id] = slot
+        for slot, global_id in enumerate(slot_to_global):
+            expert_map[int(global_id)] = slot
         return expert_map
 
-    def map_global_expert_id_to_full_local_expert_id(
-            self, expert_id: int) -> int:
-        if self.full_expert_map is None:
-            return expert_id
-        return self.full_expert_map[expert_id].item()
+    @staticmethod
+    def _slot_experts(expert_map: torch.Tensor,
+                      local_count: int) -> list[int]:
+        local_experts = sorted(
+            (local_id, global_id)
+            for global_id, local_id in enumerate(
+                expert_map.detach().cpu().tolist())
+            if local_id >= 0)
+        if len(local_experts) != local_count:
+            raise ValueError(
+                f"Expert map describes {len(local_experts)} experts, "
+                f"but the layer owns {local_count} slots.")
+        return [global_id for _, global_id in local_experts]
 
     def build_hot_local_routing(self, topk_ids: torch.Tensor,
                                 cold_mask: torch.Tensor) -> tuple[
                                     torch.Tensor, torch.Tensor]:
-        if self.resident_local_num_experts <= 0:
-            return torch.zeros_like(topk_ids), torch.zeros_like(
-                cold_mask, dtype=torch.bool)
-
-        expert_map = self._resident_maps_by_device.get(topk_ids.device)
-        if expert_map is None:
-            if self._expert_map is None:
-                expert_map = torch.arange(self.global_num_experts,
-                                          dtype=torch.long)
-            else:
-                expert_map = self._expert_map.detach().to(dtype=torch.long)
-            expert_map = expert_map.to(device=topk_ids.device,
-                                       non_blocking=True)
-            if not get_forward_context().in_profile_run:
-                self._resident_maps_by_device[topk_ids.device] = expert_map
-
-        local_ids, is_local = map_expert_ids(topk_ids, expert_map)
-        hot_mask = is_local & ~cold_mask
-        hot_ids = local_ids.masked_fill(~hot_mask, 0)
-        return hot_ids.to(topk_ids.dtype), hot_mask
+        return self.runtime_core.hot_routing(self, topk_ids, cold_mask)
 
     def _get_quant_type(self) -> QuantType:
         method = getattr(self.quant_method, "quant_method", None)
@@ -481,18 +499,6 @@ class RuntimeAscendFusedMoE(FusedMoE):
         forward_context = get_forward_context()
         enable_force_load_balance = forward_context.in_profile_run
         moe_comm_method = forward_context.moe_comm_method
-        if self.runtime_config.runtime_mode == "balance":
-            moe_comm_type = getattr(forward_context, "moe_comm_type", None)
-            uses_allgather = (
-                moe_comm_type == MoECommType.ALLGATHER
-                or moe_comm_method.__class__.__name__
-                == "RuntimeAllGatherCommImpl")
-            if not uses_allgather:
-                raise NotImplementedError(
-                    "runtime_mode=balance currently supports only AllGather "
-                    "MoE communication. Select AllGather or add a matching "
-                    "runtime all2all dispatcher that honors expert_map/log2phy."
-                )
 
         hidden_states, router_logits, mc2_mask, context_metadata = (
             moe_comm_method.prepare(

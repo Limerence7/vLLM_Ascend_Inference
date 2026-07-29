@@ -18,14 +18,11 @@ class RuntimeConfig:
     imbalance_threshold: float = 0.2
 
     num_buffers: int = 2
-    num_experts_per_update: int = 1
-    global_balance: bool = True
-    share_all_cpu_experts: bool = True
-    shared_cpu_expert_dir: str = "/dev/shm/vllm_ascend_runtime"
-    shared_cpu_expert_name: str | None = None
 
     enable_offline_scheduler: bool = False
     min_step_tokens: int = 4000
+    balance_audit_path: str | None = None
+    balance_audit_interval: int = 1
 
     def validate(self) -> None:
         self.runtime_mode = self.runtime_mode.strip().lower()
@@ -36,19 +33,16 @@ class RuntimeConfig:
             'num_buffers must be a positive integer.')
         assert self.policy_interval > 0, (
             'policy_interval must be a positive integer.')
-        assert self.num_experts_per_update > 0, (
-            'num_experts_per_update must be a positive integer.')
         assert self.min_step_tokens >= 0, (
             'min_step_tokens must be a non-negative integer.')
+        assert self.balance_audit_interval > 0, (
+            'balance_audit_interval must be a positive integer.')
         if self.runtime_mode == "profile":
             assert self.num_runtime_experts == 0, (
                 'profile mode must keep num_runtime_experts at 0.')
         if self.runtime_mode == "offload":
             assert self.num_runtime_experts <= 0, (
                 'offload mode expects num_runtime_experts <= 0.')
-        if self.runtime_mode == "balance":
-            self.global_balance = True
-            self.share_all_cpu_experts = True
 
     @property
     def offload_count(self) -> int:
@@ -73,27 +67,12 @@ class RuntimeConfig:
             self.runtime_mode in ("offload", "balance")
             and self.num_runtime_experts < 0)
 
-    @property
-    def stores_all_cpu_experts(self) -> bool:
-        return self.runtime_mode == "balance"
-
-    @property
-    def use_cpu_experts(self) -> bool:
-        return self.stores_all_cpu_experts or self.uses_cold_buffer
-
     def prepare_for_model(self, num_layers: int, num_experts: int) -> None:
         self.validate()
 
         layer_ids = (
             sorted(set(self.runtime_layer_ids))
             or list(range(0, num_layers, self.interval)))
-
-        if self.runtime_mode == "profile":
-            self.runtime_layer_ids = [
-                layer_id for layer_id in layer_ids
-                if 0 <= layer_id < num_layers
-            ]
-            return
 
         self.runtime_layer_ids = [
             layer_id for layer_id in layer_ids
@@ -111,6 +90,8 @@ def get_runtime_config() -> RuntimeConfig:
 def set_runtime_config(config: RuntimeConfig) -> RuntimeConfig:
     global RUNTIME_CONFIG
     RUNTIME_CONFIG = replace(
-        config, runtime_layer_ids=list(config.runtime_layer_ids))
+        config,
+        runtime_layer_ids=list(config.runtime_layer_ids),
+    )
     RUNTIME_CONFIG.validate()
     return RUNTIME_CONFIG

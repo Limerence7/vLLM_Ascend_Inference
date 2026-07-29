@@ -98,6 +98,7 @@ class LoadHistory:
 class BalancePlan:
     expert_map: torch.Tensor
     log2phy: torch.Tensor
+    slot_to_global: list[int]
     redundant_experts: list[int]
 
 
@@ -110,24 +111,21 @@ class ExpertPolicy:
     def history_load(self, layer) -> torch.Tensor | None:
         return self.history.global_load_for_layer(layer)
 
-    def offload_resident_ids(
+    def offload_expert_map(
         self,
-        layer,
+        local_expert_map: list[int],
         num_resident: int,
         global_load: torch.Tensor | None,
     ) -> list[int]:
-        if num_resident <= 0:
-            return []
-
-        local_by_global = {
-            global_id: local_id
-            for local_id, global_id in self._local_experts(layer)
-        }
-        return [
-            local_by_global[global_id]
-            for global_id in ranked_experts_by_load(
-                global_load, list(local_by_global))[:num_resident]
+        """Return one hot-first slot-to-global map for an offload layer."""
+        hot_experts = ranked_experts_by_load(
+            global_load, local_expert_map)[:num_resident]
+        hot_set = set(hot_experts)
+        cold_experts = [
+            expert_id for expert_id in local_expert_map
+            if expert_id not in hot_set
         ]
+        return [*hot_experts, *cold_experts]
 
     def balance_plan(
         self,
@@ -163,6 +161,7 @@ class ExpertPolicy:
         return BalancePlan(
             expert_map=expert_map,
             log2phy=log2phy[ep_rank],
+            slot_to_global=list(target_slots[ep_rank]),
             redundant_experts=redundant_experts_from_map(
                 expert_map, base_slots),
         )
@@ -173,14 +172,17 @@ class ExpertPolicy:
         num_experts: int,
         ep_size: int,
         slots_per_rank: int,
+        expert_ids: list[int] | None = None,
     ) -> list[list[int]]:
-        if ep_size * slots_per_rank < num_experts:
+        if expert_ids is None:
+            expert_ids = list(range(num_experts))
+        if ep_size * slots_per_rank < len(expert_ids):
             raise ValueError("not enough slots to place every expert.")
 
         load = _load_tensor(counts, num_experts)
         slots: list[list[int]] = [[] for _ in range(ep_size)]
         rank_loads = [0.0] * ep_size
-        ranked = ranked_experts_by_load(load, list(range(num_experts)))
+        ranked = ranked_experts_by_load(load, expert_ids)
 
         for expert_id in ranked:
             rank = _lightest_rank(slots, rank_loads, slots_per_rank)
@@ -271,24 +273,8 @@ class ExpertPolicy:
                 rank_slots.append(cursor % num_experts)
                 cursor += 1
 
-    @staticmethod
-    def _local_experts(layer) -> list[tuple[int, int]]:
-        if layer.full_expert_map is None:
-            return [
-                (expert_id, expert_id)
-                for expert_id in range(int(layer.global_num_experts))
-            ]
-
-        expert_map = layer.full_expert_map.detach().cpu().tolist()
-        return [(local_id, global_id)
-                for global_id, local_id in enumerate(expert_map)
-                if local_id >= 0]
-
-
-def redundant_experts_from_map(expert_map: torch.Tensor | None,
+def redundant_experts_from_map(expert_map: torch.Tensor,
                                local_count: int) -> list[int]:
-    if expert_map is None:
-        return []
     return [
         expert_id
         for expert_id, slot in enumerate(expert_map.detach().cpu().tolist())

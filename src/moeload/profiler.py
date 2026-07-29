@@ -23,6 +23,8 @@ class ExpertLoadProfiler:
         self._counts: dict[int, torch.Tensor] = {}
         self._last_load_snapshot: dict[int, torch.Tensor] = {}
         self._local_to_global: dict[int, torch.Tensor] = {}
+        self._device_slot_maps: dict[
+            tuple[int, str, tuple[int, ...]], torch.Tensor] = {}
         self._metadata = dict(metadata or {})
         self._metadata["rank"] = self.rank
 
@@ -36,11 +38,13 @@ class ExpertLoadProfiler:
             return dist.get_rank()
         return 0
 
-    def register_layer(self, layer) -> None:
+    def register_layer(self, layer,
+                       slot_to_global: list[int] | torch.Tensor | None = None
+                       ) -> None:
         layer_id = layer.moe_instance_id
         num_experts = layer.global_num_experts
         self._layers[layer_id] = num_experts
-        self._local_to_global[layer_id] = self._build_local_to_global(layer)
+        self.update_layer_map(layer, slot_to_global)
         self._counts.setdefault(
             layer_id,
             torch.zeros(num_experts, dtype=torch.long, device="cpu"),
@@ -50,10 +54,16 @@ class ExpertLoadProfiler:
             torch.zeros(num_experts, dtype=torch.long, device="cpu"),
         )
 
-    def update_layer_map(self, layer) -> None:
+    def update_layer_map(
+        self,
+        layer,
+        slot_to_global: list[int] | torch.Tensor | None = None,
+    ) -> None:
         layer_id = layer.moe_instance_id
-        self._local_to_global[layer_id] = (
-            self._build_local_to_global(layer))
+        if slot_to_global is None:
+            slot_to_global = self._slot_to_global_from_lookup(layer)
+        self._local_to_global[layer_id] = torch.as_tensor(
+            slot_to_global, dtype=torch.long, device="cpu").clone()
 
     def record_expert_tokens(
         self,
@@ -79,17 +89,30 @@ class ExpertLoadProfiler:
             return
 
         num_experts = self._layers[layer_id]
-        local_counts = self._to_counts(expert_tokens, group_list_type)
-        local_counts = local_counts.to(device="cpu", dtype=torch.long)
-        global_counts = torch.zeros(num_experts, dtype=torch.long, device="cpu")
+        local_counts = self._to_counts(
+            expert_tokens, group_list_type).to(dtype=torch.long)
+        device = local_counts.device
+        counts = self._counts[layer_id]
+        if counts.device != device:
+            # Keep counters next to the fused MoE output. Moving the small
+            # counter to CPU for every layer forces the NPU stream to
+            # synchronize and destroys CPU/NPU transfer overlap.
+            counts = counts.to(device=device, non_blocking=True)
+            self._counts[layer_id] = counts
 
-        slot_to_global = slot_to_global.to(device="cpu", dtype=torch.long)
+        cpu_slot_map = slot_to_global.to(device="cpu", dtype=torch.long)
+        map_values = tuple(int(value) for value in cpu_slot_map.tolist())
+        map_key = (layer_id, str(device), map_values)
+        device_slot_map = self._device_slot_maps.get(map_key)
+        if device_slot_map is None:
+            device_slot_map = cpu_slot_map.to(device=device,
+                                              non_blocking=True)
+            self._device_slot_maps[map_key] = device_slot_map
+
         size = min(local_counts.numel(), slot_to_global.numel())
-        global_ids = slot_to_global[:size]
+        global_ids = device_slot_map[:size]
         valid = (global_ids >= 0) & (global_ids < num_experts)
-        global_counts.index_add_(0, global_ids[valid],
-                                 local_counts[:size][valid])
-        self._counts[layer_id].add_(global_counts)
+        counts.index_add_(0, global_ids[valid], local_counts[:size][valid])
 
     def get_layer_load(self, layer_id: int) -> torch.Tensor:
         return self._counts[layer_id].detach().cpu()
@@ -103,6 +126,8 @@ class ExpertLoadProfiler:
 
     def save(self) -> None:
         target_path = self._rank_file_path(self.path)
+        if target_path is None:
+            return
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -150,23 +175,22 @@ class ExpertLoadProfiler:
             ]).detach()
 
     @staticmethod
-    def _build_local_to_global(layer) -> torch.Tensor:
-        if layer.full_expert_map is None:
-            return torch.arange(layer.global_num_experts, dtype=torch.long)
-
-        full_map = layer.full_expert_map.detach().to(device="cpu",
-                                                     dtype=torch.long)
-        local_num_experts = int(torch.sum(full_map >= 0).item())
+    def _slot_to_global_from_lookup(layer) -> torch.Tensor:
+        lookup = layer._expert_map.detach().to(device="cpu",
+                                               dtype=torch.long)
+        local_num_experts = int(torch.sum(lookup >= 0).item())
         local_to_global = torch.full((local_num_experts, ),
                                      -1,
                                      dtype=torch.long,
                                      device="cpu")
-        for global_id, local_id in enumerate(full_map.tolist()):
+        for global_id, local_id in enumerate(lookup.tolist()):
             if local_id >= 0:
                 local_to_global[local_id] = global_id
         return local_to_global
 
     def _rank_file_path(self, path: str | None) -> Path | None:
+        if path is None:
+            return None
         directory = Path(path)
         rank_name = f"{directory.name}_rank{self.rank}"
         return directory / f"{rank_name}.json"

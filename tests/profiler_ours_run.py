@@ -1,64 +1,38 @@
 import src
 import json
-from pathlib import Path
+import torch
+import torch_npu
 
+from pathlib import Path
 from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
 
-# LOAD_HISTORY_PATH = (
-#     Path(__file__).resolve().parents[1]
-#     / "load_records"
-#     / "only_run_load_history"
-# )
-# AUDIT_PATH = (
-#     Path(__file__).resolve().parents[1]
-#     / "load_records"
-#     / "only_run_audit_path"
-# )
-
-# TEST_CONFIG = {
-#     "model_path": "/workspace/models/Qwen3-30B-A3B",
-#     "batch_size": 2048,
-#     "max_length": 2048,
-#     "max_new_tokens": 512,
-#     "world_size": 4,
-#     "utilization": 0.85,
-# }
-
-# LOAD_HISTORY_PATH = (
-#     Path(__file__).resolve().parents[1]
-#     / "load_records"
-#     / "only_run_235b_w8a8"
-# )
-# TEST_CONFIG = {
-#     "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
-#     "batch_size": 1024,
-#     "max_length": 2560,
-#     "max_new_tokens": 2560,
-#     "world_size": 8,
-#     "utilization": 0.80,
-# }
-
 LOAD_HISTORY_PATH = (
     Path(__file__).resolve().parents[1]
     / "load_records"
-    / "only_run_235b"
+    / "only_run_load_history"
 )
+AUDIT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "load_records"
+    / "only_run_audit_path"
+)
+
 TEST_CONFIG = {
-    "model_path": "/workspace/models/Qwen3-235B-A22B",
-    "batch_size": 512,
-    "max_length": 1024,
+    "model_path": "/workspace/models/Qwen3-30B-A3B",
+    "batch_size": 768,
+    "max_length": 2048,
     "max_new_tokens": 512,
-    "world_size": 8,
-    "utilization": 0.98,
+    "world_size": 4,
+    "utilization": 0.85,
 }
 
 RUNTIME_CONFIG = RuntimeConfig(
     runtime_mode="offload",
     interval=16,
     num_buffers=2,
-    num_runtime_experts=-16,
+    num_runtime_experts=-2,
     cpu_pin_memory=True,
     runtime_layer_ids=[],
     load_history_path=str(LOAD_HISTORY_PATH),
@@ -94,14 +68,14 @@ def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):
                 num_seqs += 1
             if num_seqs >= batch_size:
                 break
-
+        
     return contents
 
 
 def build_prompts(batch_size: int, max_length: int, tokenizer) -> list[str]:
     jsonl_path = "/workspace/Huawei/datasets/computer_en_26k.jsonl"
     combined_list = load_contents_from_jsonl(
-        jsonl_path,
+        jsonl_path, 
         tokenizer,
         batch_size,
         max_length
@@ -168,14 +142,40 @@ if __name__ == "__main__":
         worker_extension_cls="src.utils.RuntimeWorkerExtension",
     )
 
-    outputs = llm.generate(
-        build_prompts(
-            TEST_CONFIG["batch_size"], 
-            TEST_CONFIG["max_length"],
-            llm.get_tokenizer(),
-        ),
-        sampling_params,
+    batch_user_inputs = build_prompts(
+        TEST_CONFIG["batch_size"], 
+        TEST_CONFIG["max_length"],
+        llm.get_tokenizer(),
     )
+    
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        export_type=torch_npu.profiler.ExportType.Text,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        msprof_tx=False,
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        l2_cache=False,
+        op_attr=True,
+        data_simplification=False,
+        record_op_args=False
+    )
+
+    with torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU
+        ],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler("./result"),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        with_modules=False,
+        with_flops=False,
+        experimental_config=experimental_config
+    ) as prof:
+        outputs = llm.generate(batch_user_inputs, sampling_params)
+        prof.step()
+    prof.export_chrome_trace("./trace.json")
+    
     save_load_history(llm)
     shutdown_llm(llm)
 

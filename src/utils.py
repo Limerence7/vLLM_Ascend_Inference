@@ -4,20 +4,14 @@ class RuntimeWorkerExtension:
     def save_load_history(self) -> dict[str, object]:
         from .runtime.runtime_core import RuntimeCore
 
-        core = RuntimeCore
-        recorder = core._adaptor or core._executor or core._profiler
-        if recorder is None:
+        profiler = RuntimeCore._profiler
+        if profiler is None:
             return {
                 "saved": False,
                 "reason": "runtime core is not initialized",
             }
 
-        if hasattr(recorder, "save_load_history"):
-            recorder.save_load_history()
-            profiler = recorder.profiler
-        else:
-            recorder.save()
-            profiler = recorder
+        profiler.save()
         num_layers = len(profiler._local_to_global)
 
         return {
