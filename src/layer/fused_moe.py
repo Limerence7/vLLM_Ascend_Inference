@@ -18,7 +18,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.eplb.core.eplb_utils import determine_default_log2phy_map
+from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
 from vllm_ascend.eplb.utils import moe_load_async_stream
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
@@ -44,6 +44,15 @@ EXPERT_WEIGHT_NAMES = (
     "w2_weight_scale",
     "w2_weight_offset",
 )
+
+
+def _default_log2phy_map(num_experts: int, ep_size: int,
+                         ep_rank: int) -> torch.Tensor:
+    global_expert_map = [
+        determine_expert_map(ep_size, rank, num_experts)[1]
+        for rank in range(ep_size)
+    ]
+    return generate_log2phy_map(global_expert_map, ep_rank)
 
 
 class RuntimeAscendFusedMoE(FusedMoE):
@@ -309,7 +318,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
                 torch.arange(self.global_num_experts, dtype=torch.int32)
                 if self.ep_size == 1 else determined_map)
             if self.dynamic_eplb:
-                self.log2phy = determine_default_log2phy_map(
+                self.log2phy = _default_log2phy_map(
                     self.global_num_experts, self.ep_size, self.ep_rank).npu()
         return init_eplb_enable, []
 
@@ -348,7 +357,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
         except Exception as e:
             logger.warning(
                 f"Init expert map of mtp/eagle when using sample.{e}")
-            self.log2phy = determine_default_log2phy_map(
+            self.log2phy = _default_log2phy_map(
                 self.global_num_experts, self.ep_size, self.ep_rank).npu()
             return False
 

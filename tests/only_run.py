@@ -39,7 +39,7 @@ TEST_CONFIG = {
 # }
 
 RUNTIME_CONFIG = RuntimeConfig(
-    runtime_mode="balance",
+    runtime_mode="offload",
     interval=16,
     num_buffers=2,
     num_runtime_experts=0,

@@ -105,6 +105,35 @@ class PreparedColdExperts(NamedTuple):
     mask: torch.Tensor | None
 
 
+class CombinedExperts:
+    """Forward-only view that exposes hot and cold NPU experts as one list."""
+
+    LIST_NAMES = (
+        "w13_weight_list",
+        "w2_weight_list",
+        "w13_weight_scale_fp32_list",
+        "w2_weight_scale_list",
+        "w2_weight_scale_fp32_list",
+    )
+
+    def __init__(self, layer, cold_experts: ColdExperts, num_experts: int):
+        self.runtime_combined_experts = True
+        self.num_experts = int(num_experts)
+        self.cold_experts = cold_experts
+
+        for name in self.LIST_NAMES:
+            hot_list = getattr(layer, name, None)
+            cold_list = getattr(cold_experts, name, None)
+            if hot_list is not None and cold_list is not None:
+                setattr(self, name, [*list(hot_list), *list(cold_list)])
+
+
+class PreparedCombinedExperts(NamedTuple):
+    experts: CombinedExperts
+    expert_map: torch.Tensor
+    slot_to_global: torch.Tensor
+
+
 class SharedTensorFactory:
     """Create CPU tensors backed by process-shared file storage."""
 
@@ -186,6 +215,10 @@ class CpuExpertWeights:
     def __init__(self, layer, expert_ids: list[int], cpu_pin_memory: bool,
                  shared_factory: SharedTensorFactory | None = None):
         self.layer_id = int(layer.moe_instance_id)
+        # File-backed tensors cannot remain shared after pin_memory(), because
+        # pinning creates a new allocation. Keep the existing shared-memory
+        # behavior and only pin privately allocated CPU weights.
+        self.cpu_pin_memory = cpu_pin_memory and shared_factory is None
         self.expert_id_to_slot = {
             expert_id: slot
             for slot, expert_id in enumerate(expert_ids)
@@ -193,7 +226,6 @@ class CpuExpertWeights:
         self.tensors = {
             name: self._empty_cpu_like(getattr(layer, name),
                                        len(expert_ids),
-                                       cpu_pin_memory,
                                        name,
                                        int(layer.tp_rank),
                                        shared_factory)
@@ -235,6 +267,11 @@ class CpuExpertWeights:
 
     def process_after_loading(self, quant_method) -> None:
         quant_method.process_offloaded_weights(self.tensors)
+        if self.cpu_pin_memory:
+            self.tensors = {
+                name: tensor.pin_memory()
+                for name, tensor in self.tensors.items()
+            }
 
     def get_weights(self,
                     expert_ids: list[int] | None = None
@@ -295,7 +332,6 @@ class CpuExpertWeights:
         self,
         template_tensor: torch.Tensor,
         num_experts: int,
-        cpu_pin_memory: bool,
         name: str,
         tp_rank: int,
         shared_factory: SharedTensorFactory | None,
@@ -311,8 +347,6 @@ class CpuExpertWeights:
         cpu_tensor = torch.empty(shape,
                                  dtype=template_tensor.dtype,
                                  device="cpu")
-        if cpu_pin_memory:
-            cpu_tensor = cpu_tensor.pin_memory()
         return cpu_tensor.contiguous()
 
 

@@ -18,6 +18,7 @@ class RuntimeConfig:
     imbalance_threshold: float = 0.2
 
     num_buffers: int = 2
+    offload_compute_mode: str = "unified"
 
     enable_offline_scheduler: bool = False
     min_step_tokens: int = 4000
@@ -31,6 +32,9 @@ class RuntimeConfig:
         assert self.interval > 0, 'interval must be a positive integer.'
         assert self.num_buffers > 0, (
             'num_buffers must be a positive integer.')
+        self.offload_compute_mode = self.offload_compute_mode.strip().lower()
+        assert self.offload_compute_mode in ("unified", "split"), (
+            'offload_compute_mode must be "unified" or "split".')
         assert self.policy_interval > 0, (
             'policy_interval must be a positive integer.')
         assert self.min_step_tokens >= 0, (

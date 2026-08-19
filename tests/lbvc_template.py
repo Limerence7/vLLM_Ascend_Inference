@@ -1,8 +1,11 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 import time
+import src
+import json
+import torch
+import torch_npu
 
+from pathlib import Path
+from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
 # Sample prompts.
@@ -11,16 +14,28 @@ prompts = [
     "The president of the United States is",
     "The capital of France is",
     "The future of AI is",
-    "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
 ]
 # Create a sampling params object.
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=50)
 
+RUNTIME_CONFIG = RuntimeConfig(
+    runtime_mode="balance",
+    interval=4,
+    num_buffers=2,
+    num_runtime_experts=-4,
+    cpu_pin_memory=True,
+    runtime_layer_ids=[],
+    load_history_path=None,
+    enable_offline_scheduler=False,
+    enable_history_mapping=False,
+)
+
 
 def main():
+    src.register_plugin(RUNTIME_CONFIG)
+    print("Loading model...")
+    print(f"Runtime config: {RUNTIME_CONFIG}")
+    
     # Create an LLM.
     llm = LLM(
         model="/workspace/models/Qwen3-30B-A3B",
@@ -28,15 +43,6 @@ def main():
         enable_expert_parallel=True,
         gpu_memory_utilization=0.85,
         trust_remote_code=True,
-        additional_config={
-            "eplb_config": {
-                "dynamic_eplb": True,
-                "expert_heat_collection_interval": 1,
-                "algorithm_execution_interval": 1,
-                "eplb_policy_type": 2,
-                "num_redundant_experts": 2,
-            }
-        },
         profiler_config={
             "profiler": "torch",
             "torch_profiler_dir": "/workspace/Huawei/vLLM_Ascend_Inference/load_records/vllm_profile",

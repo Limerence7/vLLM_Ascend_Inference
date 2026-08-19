@@ -19,10 +19,10 @@ from vllm import LLM, SamplingParams
 
 # TEST_CONFIG = {
 #     "model_path": "/workspace/models/Qwen3-30B-A3B",
-#     "batch_size": 2048,
+#     "batch_size": 512,
 #     "max_length": 2048,
 #     "max_new_tokens": 512,
-#     "world_size": 4,
+#     "world_size": 2,
 #     "utilization": 0.85,
 # }
 
@@ -49,14 +49,14 @@ TEST_CONFIG = {
     "model_path": "/workspace/models/Qwen3-235B-A22B",
     "batch_size": 512,
     "max_length": 1024,
-    "max_new_tokens": 512,
+    "max_new_tokens": 32,
     "world_size": 8,
     "utilization": 0.98,
 }
 
 RUNTIME_CONFIG = RuntimeConfig(
     runtime_mode="offload",
-    interval=16,
+    interval=12,
     num_buffers=2,
     num_runtime_experts=-16,
     cpu_pin_memory=True,

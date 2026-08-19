@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 from ..layer.routing import map_expert_ids
 from ..runtime_config import RuntimeConfig
-from .memory_manager import ColdExperts, ExpertMemoryManager, PreparedColdExperts
+from .memory_manager import (ColdExperts, CombinedExperts, ExpertMemoryManager,
+                             PreparedColdExperts, PreparedCombinedExperts)
 
 
 class ExoExecutor(nn.Module):
@@ -22,6 +23,8 @@ class ExoExecutor(nn.Module):
         self.expert_maps: dict[int, list[int]] = {}
         self.routing_maps: dict[
             int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.full_expert_maps: dict[int, torch.Tensor] = {}
+        self.full_slot_maps: dict[int, torch.Tensor] = {}
         self.cold_experts = nn.ModuleList()
         self.buffer_idx = 0
         self.buffer_status: list[int | None] = []
@@ -88,18 +91,24 @@ class ExoExecutor(nn.Module):
 
     def prepare_cold_experts(self, layer,
                              topk_ids: torch.Tensor) -> PreparedColdExperts:
-        current_layer = layer.moe_instance_id
-        if current_layer == self.buffer_status[self.buffer_idx]:
-            cold_expert = self.cold_experts[self.buffer_idx]
-        else:
-            cold_expert = self._start_prefetch(layer, self.buffer_idx)
-        self.buffer_idx = (self.buffer_idx + 1) % self.config.num_buffers
+        cold_expert = self._prepare_cold_buffer(layer)
 
         _, cold_map = self._routing_maps(layer, topk_ids.device)
         cold_topk_ids, cold_mask = map_expert_ids(topk_ids, cold_map)
         cold_topk_ids = cold_topk_ids.masked_fill(~cold_mask, 0).to(
             topk_ids.dtype)
         return PreparedColdExperts(cold_expert, cold_topk_ids, cold_mask)
+
+    def prepare_combined_experts(self, layer,
+                                 device: torch.device) -> PreparedCombinedExperts:
+        cold_expert = self._prepare_cold_buffer(layer)
+        layer_id = layer.moe_instance_id
+        expert_ids = self.expert_maps[layer_id]
+        return PreparedCombinedExperts(
+            CombinedExperts(layer, cold_expert, len(expert_ids)),
+            self._full_expert_map(layer, device),
+            self._full_slot_to_global(layer, device),
+        )
 
     def hot_routing(self, layer, topk_ids: torch.Tensor,
                     cold_mask: torch.Tensor) -> tuple[torch.Tensor,
@@ -128,6 +137,8 @@ class ExoExecutor(nn.Module):
         cold_experts = self._cold_experts(layer_id)
         self.expert_maps[layer_id] = [*expert_ids, *cold_experts]
         self.routing_maps.pop(layer_id, None)
+        self.full_expert_maps.pop(layer_id, None)
+        self.full_slot_maps.pop(layer_id, None)
 
     def _hot_count(self, num_slots: int) -> int:
         return (max(0, num_slots - self.config.offload_count)
@@ -162,6 +173,34 @@ class ExoExecutor(nn.Module):
                 f"but received {device}.")
         return maps
 
+    def _full_expert_map(self, layer, device: torch.device) -> torch.Tensor:
+        layer_id = layer.moe_instance_id
+        expert_map = self.full_expert_maps.get(layer_id)
+        if expert_map is None:
+            expert_map = self._build_routing_map(layer,
+                                                 self.expert_maps[layer_id],
+                                                 device)
+            self.full_expert_maps[layer_id] = expert_map
+        if expert_map.device != device:
+            raise RuntimeError(
+                f"Layer {layer_id} is bound to {expert_map.device}, "
+                f"but received {device}.")
+        return expert_map
+
+    def _full_slot_to_global(self, layer, device: torch.device) -> torch.Tensor:
+        layer_id = layer.moe_instance_id
+        slot_map = self.full_slot_maps.get(layer_id)
+        if slot_map is None:
+            slot_map = torch.tensor(self.expert_maps[layer_id],
+                                    dtype=torch.long,
+                                    device=device)
+            self.full_slot_maps[layer_id] = slot_map
+        if slot_map.device != device:
+            raise RuntimeError(
+                f"Layer {layer_id} is bound to {slot_map.device}, "
+                f"but received {device}.")
+        return slot_map
+
     @staticmethod
     def _build_routing_map(layer, expert_ids: list[int],
                            device: torch.device) -> torch.Tensor:
@@ -190,6 +229,15 @@ class ExoExecutor(nn.Module):
                     device=_layer_device(self.layers[template_id]),
                     use_w8a8=self.uses_w8a8,
                 ))
+
+    def _prepare_cold_buffer(self, layer) -> ColdExperts:
+        current_layer = layer.moe_instance_id
+        if current_layer == self.buffer_status[self.buffer_idx]:
+            cold_expert = self.cold_experts[self.buffer_idx]
+        else:
+            cold_expert = self._start_prefetch(layer, self.buffer_idx)
+        self.buffer_idx = (self.buffer_idx + 1) % self.config.num_buffers
+        return cold_expert
 
     def _start_prefetch(self, layer, buffer_id: int) -> ColdExperts:
         layer_id = layer.moe_instance_id
