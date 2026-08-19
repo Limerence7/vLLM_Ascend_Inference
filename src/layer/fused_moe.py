@@ -437,11 +437,6 @@ class RuntimeAscendFusedMoE(FusedMoE):
                 f"but the layer owns {local_count} slots.")
         return [global_id for _, global_id in local_experts]
 
-    def build_hot_local_routing(self, topk_ids: torch.Tensor,
-                                cold_mask: torch.Tensor) -> tuple[
-                                    torch.Tensor, torch.Tensor]:
-        return self.runtime_core.hot_routing(self, topk_ids, cold_mask)
-
     def _get_quant_type(self) -> QuantType:
         method = getattr(self.quant_method, "quant_method", None)
         if method is None:

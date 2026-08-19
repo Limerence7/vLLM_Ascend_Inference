@@ -15,8 +15,7 @@ from vllm_ascend.quantization.w8a8_dynamic import \
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                maybe_trans_nz)
 
-from .routing import (add_routing_output, build_routing_view,
-                      dispatch_with_local_experts, select_optional_rows)
+from .routing import dispatch_with_local_experts
 from .moe_mlp import unified_apply_mlp as runtime_unified_apply_mlp
 
 
@@ -39,29 +38,6 @@ class RuntimeFusedMoEMethod:
                        pertoken_scale: torch.Tensor | None) -> Any:
         raise NotImplementedError
 
-    def _run_experts(self, layer, moe_comm_method, experts, routing,
-                     global_num_experts, expert_map, log2phy,
-                     global_redundant_expert_num, shared_experts,
-                     apply_router_weight_on_input, dynamic_eplb,
-                     mc2_mask, pertoken_scale):
-        return self._fused_experts(
-            layer=layer,
-            moe_comm_method=moe_comm_method,
-            experts=experts,
-            hidden_states=routing.hidden_states,
-            topk_weights=routing.topk_weights,
-            topk_ids=routing.topk_ids,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            log2phy=log2phy,
-            global_redundant_expert_num=global_redundant_expert_num,
-            shared_experts=shared_experts,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            dynamic_eplb=dynamic_eplb,
-            mc2_mask=mc2_mask,
-            pertoken_scale=pertoken_scale,
-        )
-
     @staticmethod
     def _record_and_unwrap(layer, result,
                            slot_to_global: torch.Tensor):
@@ -78,129 +54,27 @@ class RuntimeFusedMoEMethod:
         return output
 
     @staticmethod
-    def _slot_to_global(layer, cold: bool) -> torch.Tensor:
-        expert_map, hot_count = layer.runtime_core.layout(layer)
-        expert_ids = (expert_map[hot_count:]
-                      if cold else expert_map[:hot_count])
-        return torch.tensor(expert_ids, dtype=torch.long)
-
-    @staticmethod
     def _unwrap_result(result):
         return result[0] if isinstance(result, tuple) else result
-
-    def _offload_dynamic_eplb(self, layer) -> bool:
-        return layer.runtime_core.collect_load
 
     def _wait_and_prefetch_next(self, layer, cold_experts) -> None:
         cold_experts.wait()
         layer.runtime_core.prefetch_next_layers(layer)
 
-    def _run_cold_experts(self, layer, moe_comm_method, x, topk_weights,
-                          cold_topk_ids, cold_mask, cold_experts,
-                          apply_router_weight_on_input, dynamic_eplb,
-                          mc2_mask, pertoken_scale):
-        num_rows = x.size(0)
-        cold_routing = build_routing_view(
-            hidden_states=x,
-            topk_ids=cold_topk_ids,
-            topk_weights=topk_weights.masked_fill(~cold_mask, 0),
-            row_mask=cold_mask.any(dim=1),
-        )
-        if cold_routing is None:
-            return None, None
-
-        cold_output = self._run_experts(
-            layer, moe_comm_method, cold_experts, cold_routing,
-            cold_experts.num_experts,
-            None, None, 0, None,
-            apply_router_weight_on_input, dynamic_eplb,
-            select_optional_rows(mc2_mask, cold_routing.row_indices,
-                                 num_rows),
-            select_optional_rows(pertoken_scale, cold_routing.row_indices,
-                                 num_rows))
-        if layer.runtime_core.collect_load:
-            cold_output = self._record_and_unwrap(
-                layer, cold_output,
-                self._slot_to_global(layer, cold=True))
-        else:
-            cold_output = self._unwrap_result(cold_output)
-        return cold_routing, cold_output
-
-    def _apply_cold_only(self, layer, moe_comm_method, x, topk_weights,
-                         cold_experts, cold_topk_ids, cold_mask,
-                         apply_router_weight_on_input, mc2_mask,
-                         pertoken_scale):
-        self._wait_and_prefetch_next(layer, cold_experts)
-        dynamic_eplb = self._offload_dynamic_eplb(layer)
-        cold_routing, cold_output = self._run_cold_experts(
-            layer, moe_comm_method, x, topk_weights, cold_topk_ids, cold_mask,
-            cold_experts, apply_router_weight_on_input, dynamic_eplb,
-            mc2_mask, pertoken_scale)
-        output = torch.zeros_like(x)
-        if cold_routing is None:
-            return output
-        add_routing_output(output, cold_routing, cold_output)
-        return output
-
-    def _apply_split_offload(self, layer, moe_comm_method, x, topk_weights,
-                             topk_ids, cold_experts, cold_topk_ids, cold_mask,
-                             shared_experts, apply_router_weight_on_input,
-                             mc2_mask, pertoken_scale):
-        output = torch.zeros_like(x)
-        num_rows = x.size(0)
-        dynamic_eplb = self._offload_dynamic_eplb(layer)
-
-        hot_topk_ids, hot_mask = layer.build_hot_local_routing(topk_ids,
-                                                               cold_mask)
-        hot_routing = build_routing_view(
-            hidden_states=x,
-            topk_ids=hot_topk_ids,
-            topk_weights=topk_weights.masked_fill(~hot_mask, 0),
-            row_mask=hot_mask.any(dim=1),
-        )
-        if hot_routing is not None:
-            hot_output = self._run_experts(
-                layer, moe_comm_method, layer, hot_routing,
-                layer.local_num_experts,
-                None, None, 0,
-                shared_experts, apply_router_weight_on_input,
-                dynamic_eplb,
-                select_optional_rows(mc2_mask, hot_routing.row_indices,
-                                     num_rows),
-                select_optional_rows(pertoken_scale, hot_routing.row_indices,
-                                     num_rows))
-            if layer.runtime_core.collect_load:
-                hot_output = self._record_and_unwrap(
-                    layer, hot_output,
-                    self._slot_to_global(layer, cold=False))
-            else:
-                hot_output = self._unwrap_result(hot_output)
-            add_routing_output(output, hot_routing, hot_output)
-
-        self._wait_and_prefetch_next(layer, cold_experts)
-        cold_routing, cold_output = self._run_cold_experts(
-            layer, moe_comm_method, x, topk_weights, cold_topk_ids, cold_mask,
-            cold_experts, apply_router_weight_on_input, dynamic_eplb,
-            mc2_mask, pertoken_scale)
-        if cold_routing is not None:
-            add_routing_output(output, cold_routing, cold_output)
-        return output
-
     def _supports_unified_offload(self, layer) -> bool:
         config = layer.runtime_core.config
-        if (config.runtime_mode != "offload"
-                or config.offload_compute_mode != "unified"):
+        if config.runtime_mode != "offload":
             return False
-        if get_forward_context().moe_comm_type in (MoECommType.MC2,
-                                                   MoECommType.FUSED_MC2):
-            return False
-        return all(
+        has_w8a8_lists = all(
             hasattr(layer, name) for name in (
                 "w13_weight_list",
                 "w2_weight_list",
                 "w13_weight_scale_fp32_list",
                 "w2_weight_scale_list",
             ))
+        has_unquantized_tensors = all(
+            hasattr(layer, name) for name in ("w13_weight", "w2_weight"))
+        return has_w8a8_lists or has_unquantized_tensors
 
     def _apply_unified_offload(self, layer, moe_comm_method, x, topk_weights,
                                topk_ids, shared_experts,
@@ -301,25 +175,14 @@ class RuntimeFusedMoEMethod:
                 pertoken_scale=pertoken_scale,
             )
 
-        if self._supports_unified_offload(layer):
-            return self._apply_unified_offload(
-                layer, moe_comm_method, x, topk_weights, topk_ids,
-                shared_experts, apply_router_weight_on_input, mc2_mask,
-                pertoken_scale)
-
-        prepared_cold_experts = layer.runtime_core.prepare_cold_experts(
-            layer, topk_ids)
-        if layer.local_num_experts == 0:
-            return self._apply_cold_only(
-                layer, moe_comm_method, x, topk_weights,
-                prepared_cold_experts.experts, prepared_cold_experts.topk_ids,
-                prepared_cold_experts.mask, apply_router_weight_on_input,
-                mc2_mask, pertoken_scale)
-        return self._apply_split_offload(
+        if not self._supports_unified_offload(layer):
+            raise NotImplementedError(
+                "Offload mode requires unified expert compute with either "
+                "W8A8 expert lists or unquantized expert tensors.")
+        return self._apply_unified_offload(
             layer, moe_comm_method, x, topk_weights, topk_ids,
-            prepared_cold_experts.experts, prepared_cold_experts.topk_ids,
-            prepared_cold_experts.mask, shared_experts,
-            apply_router_weight_on_input, mc2_mask, pertoken_scale)
+            shared_experts, apply_router_weight_on_input, mc2_mask,
+            pertoken_scale)
 
 
 class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
@@ -353,6 +216,26 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
                        log2phy, global_redundant_expert_num,
                        shared_experts, apply_router_weight_on_input,
                        dynamic_eplb, mc2_mask, pertoken_scale):
+        if getattr(experts, "runtime_combined_experts", False):
+            with dispatch_with_local_experts(moe_comm_method,
+                                             experts.num_experts):
+                return self._runtime_fused_experts(
+                    moe_comm_method=moe_comm_method,
+                    hidden_states=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                    w1=experts.w13_weight_list,
+                    w2=experts.w2_weight_list,
+                    shared_experts=shared_experts,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    dynamic_eplb=dynamic_eplb,
+                    mc2_mask=mc2_mask,
+                    pertoken_scale=pertoken_scale,
+                    log2phy=log2phy,
+                    global_redundant_expert_num=global_redundant_expert_num)
+
         local_num_experts = experts.w13_weight.shape[0]
         eplb_kwargs = {}
         if log2phy is not None:
@@ -376,6 +259,57 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
                 pertoken_scale=pertoken_scale,
                 **eplb_kwargs)
 
+    @staticmethod
+    def _runtime_fused_experts(
+            moe_comm_method,
+            hidden_states: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            global_num_experts: int,
+            expert_map: torch.Tensor,
+            w1: list[torch.Tensor],
+            w2: list[torch.Tensor],
+            shared_experts: Any | None,
+            apply_router_weight_on_input: bool,
+            dynamic_eplb: bool,
+            mc2_mask: torch.Tensor | None,
+            pertoken_scale: torch.Tensor | None,
+            log2phy: torch.Tensor | None = None,
+            global_redundant_expert_num: int = 0):
+        results = moe_comm_method.token_dispatcher.token_dispatch(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+            log2phy=log2phy,
+            global_redundant_expert_num=global_redundant_expert_num,
+            shared_experts=shared_experts,
+            quantized_x_for_share=None,
+            dynamic_scale_for_share=None,
+            mc2_mask=mc2_mask,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            with_quant=False,
+            dynamic_eplb=dynamic_eplb,
+            pertoken_scale=pertoken_scale)
+
+        expert_tokens = results["group_list"]
+        group_list_type = results["group_list_type"]
+        mlp_output = runtime_unified_apply_mlp(
+            hidden_states=results["hidden_states"],
+            w1=w1,
+            w2=w2,
+            group_list=expert_tokens,
+            group_list_type=group_list_type,
+            topk_scales=results.get("topk_scales"),
+            with_quant=False,
+            dynamic_eplb=dynamic_eplb)
+        final_hidden_states = moe_comm_method.token_dispatcher.token_combine(
+            hidden_states=mlp_output,
+            context_metadata=results.get("context_metadata"))
+        if dynamic_eplb:
+            return final_hidden_states, group_list_type, expert_tokens
+        return final_hidden_states
+
 
 class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                                       QuantizeMethodBase):
@@ -392,9 +326,6 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
 
     def create_weights(self, *args, **kwargs):
         return self.base_method.create_weights(*args, **kwargs)
-
-    def _offload_dynamic_eplb(self, layer) -> bool:
-        return layer.runtime_core.collect_load
 
     def process_weights_after_loading(self, layer):
         self.base_method.process_weights_after_loading(layer)
@@ -421,7 +352,9 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                        shared_experts, apply_router_weight_on_input,
                        dynamic_eplb, mc2_mask, pertoken_scale):
         context = get_forward_context()
-        fused_mc2 = context.moe_comm_type == MoECommType.FUSED_MC2
+        combined_experts = getattr(experts, "runtime_combined_experts", False)
+        fused_mc2 = (context.moe_comm_type == MoECommType.FUSED_MC2
+                     and not combined_experts)
         w1 = self._weight_arg(experts, "w13_weight_list", "w13_weight",
                               fused_mc2)
         w2 = self._weight_arg(experts, "w2_weight_list", "w2_weight",
@@ -445,7 +378,7 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                 "log2phy": log2phy,
                 "global_redundant_expert_num": global_redundant_expert_num,
             }
-        if getattr(experts, "runtime_combined_experts", False):
+        if combined_experts:
             with dispatch_with_local_experts(moe_comm_method, local_num_experts):
                 return self._runtime_fused_experts(
                     moe_comm_method=moe_comm_method,

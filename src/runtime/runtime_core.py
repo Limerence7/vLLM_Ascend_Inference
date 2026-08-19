@@ -160,19 +160,9 @@ class RuntimeCore:
             assert self.executor is not None
             self.executor.process_layer_after_loading(layer, quant_method)
 
-    def prepare_cold_experts(self, layer, topk_ids: torch.Tensor):
-        assert self.executor is not None
-        return self.executor.prepare_cold_experts(layer, topk_ids)
-
     def prepare_combined_experts(self, layer, device: torch.device):
         assert self.executor is not None
         return self.executor.prepare_combined_experts(layer, device)
-
-    def hot_routing(self, layer, topk_ids: torch.Tensor,
-                    cold_mask: torch.Tensor) -> tuple[torch.Tensor,
-                                                       torch.Tensor]:
-        assert self.executor is not None
-        return self.executor.hot_routing(layer, topk_ids, cold_mask)
 
     def prefetch_next_layers(self, layer) -> None:
         assert self.executor is not None

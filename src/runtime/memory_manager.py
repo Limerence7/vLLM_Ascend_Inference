@@ -99,12 +99,6 @@ class ColdExperts(nn.Module):
         setattr(self, f"{name}_fp32_list", nn.ParameterList(tensors))
 
 
-class PreparedColdExperts(NamedTuple):
-    experts: ColdExperts
-    topk_ids: torch.Tensor | None
-    mask: torch.Tensor | None
-
-
 class CombinedExperts:
     """Forward-only view that exposes hot and cold NPU experts as one list."""
 
@@ -115,6 +109,7 @@ class CombinedExperts:
         "w2_weight_scale_list",
         "w2_weight_scale_fp32_list",
     )
+    TENSOR_NAMES = ("w13_weight", "w2_weight")
 
     def __init__(self, layer, cold_experts: ColdExperts, num_experts: int):
         self.runtime_combined_experts = True
@@ -126,6 +121,16 @@ class CombinedExperts:
             cold_list = getattr(cold_experts, name, None)
             if hot_list is not None and cold_list is not None:
                 setattr(self, name, [*list(hot_list), *list(cold_list)])
+
+        for name in self.TENSOR_NAMES:
+            list_name = f"{name}_list"
+            if hasattr(self, list_name):
+                continue
+            hot_tensor = getattr(layer, name, None)
+            cold_tensor = getattr(cold_experts, name, None)
+            if hot_tensor is not None and cold_tensor is not None:
+                setattr(self, list_name,
+                        [*hot_tensor.unbind(0), *cold_tensor.unbind(0)])
 
 
 class PreparedCombinedExperts(NamedTuple):
