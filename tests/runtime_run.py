@@ -56,8 +56,11 @@ RUNTIME_CONFIG = RuntimeConfig(
     cpu_pin_memory=True,
     runtime_layer_ids=[],
     load_history_path=str(LOAD_HISTORY_PATH),
-    enable_offline_scheduler=False,
+    enable_offline_scheduler=True,
     enable_history_mapping=False,
+    scheduler_policy="expert",
+    scheduler_min_step_tokens=4096,
+    scheduler_reorder_window=64,
 )
 
 def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):

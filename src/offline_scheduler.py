@@ -2,26 +2,40 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Deque, Optional, Set
+from typing import Any, Deque, Optional, Set
 
 
 _PATCHED = False
 _MIN_STEP_TOKENS = 2000
+_REORDER_WINDOW = 64
+_SCHEDULER_POLICY = "expert"
 _ORIGINAL_CHUNKED_PREFILL = None
 _SCHEDULER_MOD = None
 
 
-def apply_offline_scheduler_patch(min_step_tokens: int = 2000) -> None:
+def apply_offline_scheduler_patch(
+    min_step_tokens: int = 2000,
+    *,
+    reorder_window: int = 64,
+    policy: str = "expert",
+) -> None:
     """Install an offline-throughput scheduler patch for vLLM V0 Scheduler.
 
     The patch is intentionally small and process-local. It adds a greedy
     waiting-queue scan for chunked prefill and uses `min_step_tokens` as a soft
-    lower bound for the total tokens scheduled in one step.
+    lower bound for the total tokens scheduled in one step. The optional
+    reorder window keeps request ordering local and independent from Runtime
+    expert placement logic.
     """
-    global _PATCHED, _MIN_STEP_TOKENS, _ORIGINAL_CHUNKED_PREFILL
+    global _PATCHED, _MIN_STEP_TOKENS, _REORDER_WINDOW, _SCHEDULER_POLICY
+    global _ORIGINAL_CHUNKED_PREFILL
     global _SCHEDULER_MOD
 
     _MIN_STEP_TOKENS = max(0, int(min_step_tokens))
+    _REORDER_WINDOW = max(1, int(reorder_window))
+    _SCHEDULER_POLICY = str(policy).strip().lower()
+    if _SCHEDULER_POLICY not in ("fifo", "throughput", "expert"):
+        _SCHEDULER_POLICY = "expert"
 
     if _PATCHED:
         return
@@ -64,12 +78,34 @@ def _apply_v1_marker_patch() -> None:
     from vllm.v1.core.sched.scheduler import Scheduler
 
     SchedulerConfig.min_step_tokens = _MIN_STEP_TOKENS
+    SchedulerConfig.scheduler_min_step_tokens = _MIN_STEP_TOKENS
+    SchedulerConfig.scheduler_reorder_window = _REORDER_WINDOW
+    SchedulerConfig.scheduler_policy = _SCHEDULER_POLICY
     Scheduler._vllm_ascend_offline_scheduler_enabled = True
     Scheduler._vllm_ascend_offline_scheduler_mode = "v1-marker"
 
 
 def _get_min_step_tokens(scheduler_config) -> int:
-    return int(getattr(scheduler_config, "min_step_tokens", _MIN_STEP_TOKENS))
+    return int(
+        getattr(
+            scheduler_config,
+            "scheduler_min_step_tokens",
+            getattr(scheduler_config, "min_step_tokens", _MIN_STEP_TOKENS),
+        ))
+
+
+def _get_reorder_window(scheduler_config) -> int:
+    return max(
+        1,
+        int(getattr(scheduler_config, "scheduler_reorder_window",
+                    _REORDER_WINDOW)),
+    )
+
+
+def _get_scheduler_policy(scheduler_config) -> str:
+    policy = str(getattr(scheduler_config, "scheduler_policy",
+                         _SCHEDULER_POLICY)).strip().lower()
+    return policy if policy in ("fifo", "throughput", "expert") else "expert"
 
 
 def _record_scheduler_output(scheduler_outputs, scheduler_config) -> None:
@@ -81,6 +117,92 @@ def _record_scheduler_output(scheduler_outputs, scheduler_config) -> None:
         scheduler_outputs,
         scheduler_config=scheduler_config,
     )
+
+
+def _maybe_reorder_waiting(self) -> None:
+    policy = _get_scheduler_policy(self.scheduler_config)
+    if policy == "fifo" or len(self.waiting) <= 1:
+        return
+
+    window = min(len(self.waiting), _get_reorder_window(self.scheduler_config))
+    candidates = [(index, self.waiting.popleft()) for index in range(window)]
+    candidates.sort(key=lambda item: _scheduler_key(item[1], item[0], policy))
+
+    for _, seq_group in reversed(candidates):
+        self.waiting.appendleft(seq_group)
+
+
+def _scheduler_key(seq_group, index: int, policy: str) -> tuple:
+    tokens = _estimate_prompt_tokens(seq_group)
+    if policy == "throughput":
+        return (-tokens, index)
+
+    expert_cost = _expert_cost_hint(seq_group)
+    has_no_hint = expert_cost is None
+    return (has_no_hint, float("inf") if has_no_hint else expert_cost,
+            -tokens, index)
+
+
+def _estimate_prompt_tokens(seq_group) -> int:
+    try:
+        waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+    except Exception:
+        waiting_seqs = []
+    seq = waiting_seqs[0] if waiting_seqs else seq_group
+
+    for name in ("get_len", "get_prompt_len", "get_num_new_tokens"):
+        method = getattr(seq, name, None)
+        if callable(method):
+            try:
+                return max(0, int(method()))
+            except TypeError:
+                pass
+    for name in ("prompt_token_ids", "token_ids", "input_ids"):
+        value = getattr(seq, name, None)
+        if value is not None:
+            try:
+                return len(value)
+            except TypeError:
+                pass
+    return 0
+
+
+def _expert_cost_hint(seq_group) -> float | None:
+    for obj in _hint_sources(seq_group):
+        value = _read_hint_value(obj)
+        if value is not None:
+            return value
+    return None
+
+
+def _hint_sources(seq_group) -> list[Any]:
+    sources: list[Any] = [seq_group]
+    for name in ("metrics", "sampling_params", "request_metadata"):
+        value = getattr(seq_group, name, None)
+        if value is not None:
+            sources.append(value)
+    return sources
+
+
+def _read_hint_value(source: Any) -> float | None:
+    names = (
+        "vllm_ascend_expert_cost",
+        "expert_cost",
+        "scheduler_cost",
+        "priority",
+    )
+    for name in names:
+        if isinstance(source, dict):
+            value = source.get(name)
+        else:
+            value = getattr(source, name, None)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _schedule_prefills_offline(
@@ -101,6 +223,7 @@ def _schedule_prefills_offline(
 
     ignored_seq_groups = []
     seq_groups = []
+    _maybe_reorder_waiting(self)
     waiting_queue = self.waiting
     leftover_waiting: Deque = deque()
     using_prompt_embeds = None

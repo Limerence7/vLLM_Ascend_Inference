@@ -12,7 +12,11 @@ def register_plugin(config: RuntimeConfig | None = None):
         from .offline_scheduler import apply_offline_scheduler_patch
         print("Applying offline scheduler patch...")
 
-        apply_offline_scheduler_patch(runtime_config.min_step_tokens)
+        apply_offline_scheduler_patch(
+            runtime_config.scheduler_min_step_tokens,
+            reorder_window=runtime_config.scheduler_reorder_window,
+            policy=runtime_config.scheduler_policy,
+        )
     ModelRegistry.register_model("Qwen3MoeForCausalLM",
                                  RuntimeQwen3MoeForCausalLM)
     return RuntimeQwen3MoeForCausalLM

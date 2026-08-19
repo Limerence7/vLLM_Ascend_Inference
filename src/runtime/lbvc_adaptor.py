@@ -133,7 +133,8 @@ class LBVCAdaptor:
         counts: torch.Tensor,
     ) -> bool:
         rank_loads = self._rank_loads(current_slots, counts)
-        if int(rank_loads.sum().item()) < int(self.config.min_step_tokens):
+        if int(rank_loads.sum().item()) < int(
+                self.config.rebalance_min_step_tokens):
             return False
 
         max_load = float(rank_loads.max().item())

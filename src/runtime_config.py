@@ -23,9 +23,14 @@ class RuntimeConfig:
 
     enable_offline_scheduler: bool = False
     min_step_tokens: int = 4000
+    scheduler_min_step_tokens: int | None = None
+    scheduler_reorder_window: int = 64
+    scheduler_policy: str = "expert"
+    rebalance_min_step_tokens: int | None = None
 
     def validate(self) -> None:
         self.runtime_mode = self.runtime_mode.strip().lower()
+        self.scheduler_policy = self.scheduler_policy.strip().lower()
         assert self.runtime_mode in RUNTIME_MODES, (
             f"{self.runtime_mode} is not supported for runtime plugin.")
         assert self.interval > 0, 'interval must be a positive integer.'
@@ -43,6 +48,18 @@ class RuntimeConfig:
             'imbalance_threshold must be a max/min ratio no smaller than 1.0.')
         assert self.min_step_tokens >= 0, (
             'min_step_tokens must be a non-negative integer.')
+        assert self.scheduler_policy in ("fifo", "throughput", "expert"), (
+            'scheduler_policy must be one of fifo, throughput or expert.')
+        assert self.scheduler_reorder_window > 0, (
+            'scheduler_reorder_window must be a positive integer.')
+        if self.scheduler_min_step_tokens is None:
+            self.scheduler_min_step_tokens = self.min_step_tokens
+        if self.rebalance_min_step_tokens is None:
+            self.rebalance_min_step_tokens = self.min_step_tokens
+        assert self.scheduler_min_step_tokens >= 0, (
+            'scheduler_min_step_tokens must be a non-negative integer.')
+        assert self.rebalance_min_step_tokens >= 0, (
+            'rebalance_min_step_tokens must be a non-negative integer.')
         if self.runtime_mode == "profile":
             assert self.num_runtime_experts == 0, (
                 'profile mode must keep num_runtime_experts at 0.')
