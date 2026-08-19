@@ -243,10 +243,12 @@ class ExpertPolicy:
                          imbalance_threshold: float) -> bool:
         if counts.numel() == 0:
             return False
-        mean = float(counts.float().mean().item())
-        return mean > 0 and (
-            float(counts.max().item() - counts.min().item()) / mean
-            >= imbalance_threshold)
+        max_load = float(counts.max().item())
+        min_load = float(counts.min().item())
+        if max_load <= 0:
+            return False
+        ratio = float("inf") if min_load <= 0 else max_load / min_load
+        return ratio > float(imbalance_threshold)
 
     @staticmethod
     def _native_slots(num_experts: int, ep_size: int) -> list[list[int]]:

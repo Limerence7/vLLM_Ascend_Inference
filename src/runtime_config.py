@@ -14,15 +14,15 @@ class RuntimeConfig:
 
     load_history_path: str | None = None
     enable_history_mapping: bool = False
+    load_collect_interval: int = 1
+    rebalance_interval: int | None = None
     policy_interval: int = 16
-    imbalance_threshold: float = 0.2
+    imbalance_threshold: float = 1.2
 
     num_buffers: int = 2
 
     enable_offline_scheduler: bool = False
     min_step_tokens: int = 4000
-    balance_audit_path: str | None = None
-    balance_audit_interval: int = 1
 
     def validate(self) -> None:
         self.runtime_mode = self.runtime_mode.strip().lower()
@@ -31,12 +31,18 @@ class RuntimeConfig:
         assert self.interval > 0, 'interval must be a positive integer.'
         assert self.num_buffers > 0, (
             'num_buffers must be a positive integer.')
+        assert self.load_collect_interval > 0, (
+            'load_collect_interval must be a positive integer.')
+        if self.rebalance_interval is None:
+            self.rebalance_interval = self.policy_interval
+        assert self.rebalance_interval > 0, (
+            'rebalance_interval must be a positive integer.')
         assert self.policy_interval > 0, (
             'policy_interval must be a positive integer.')
+        assert self.imbalance_threshold >= 1.0, (
+            'imbalance_threshold must be a max/min ratio no smaller than 1.0.')
         assert self.min_step_tokens >= 0, (
             'min_step_tokens must be a non-negative integer.')
-        assert self.balance_audit_interval > 0, (
-            'balance_audit_interval must be a positive integer.')
         if self.runtime_mode == "profile":
             assert self.num_runtime_experts == 0, (
                 'profile mode must keep num_runtime_experts at 0.')

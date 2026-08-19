@@ -61,9 +61,9 @@ class RuntimeFusedMoEMethod:
         cold_experts.wait()
         layer.runtime_core.prefetch_next_layers(layer)
 
-    def _supports_unified_offload(self, layer) -> bool:
+    def _supports_unified_cold_buffer(self, layer) -> bool:
         config = layer.runtime_core.config
-        if config.runtime_mode != "offload":
+        if config.runtime_mode not in ("offload", "balance"):
             return False
         has_w8a8_lists = all(
             hasattr(layer, name) for name in (
@@ -76,10 +76,10 @@ class RuntimeFusedMoEMethod:
             hasattr(layer, name) for name in ("w13_weight", "w2_weight"))
         return has_w8a8_lists or has_unquantized_tensors
 
-    def _apply_unified_offload(self, layer, moe_comm_method, x, topk_weights,
-                               topk_ids, shared_experts,
-                               apply_router_weight_on_input, mc2_mask,
-                               pertoken_scale):
+    def _apply_unified_cold_buffer(self, layer, moe_comm_method, x,
+                                   topk_weights, topk_ids, shared_experts,
+                                   apply_router_weight_on_input, mc2_mask,
+                                   pertoken_scale):
         prepared = layer.runtime_core.prepare_combined_experts(
             layer, topk_ids.device)
         self._wait_and_prefetch_next(layer, prepared.experts.cold_experts)
@@ -175,11 +175,11 @@ class RuntimeFusedMoEMethod:
                 pertoken_scale=pertoken_scale,
             )
 
-        if not self._supports_unified_offload(layer):
+        if not self._supports_unified_cold_buffer(layer):
             raise NotImplementedError(
-                "Offload mode requires unified expert compute with either "
+                "Cold-buffer runtime requires unified expert compute with either "
                 "W8A8 expert lists or unquantized expert tensors.")
-        return self._apply_unified_offload(
+        return self._apply_unified_cold_buffer(
             layer, moe_comm_method, x, topk_weights, topk_ids,
             shared_experts, apply_router_weight_on_input, mc2_mask,
             pertoken_scale)

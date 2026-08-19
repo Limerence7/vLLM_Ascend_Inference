@@ -14,70 +14,40 @@ class HcclCopyTask:
 
 
 @dataclass(frozen=True)
-class TransferPlan:
+class ExpertUpdateTask:
     target_slots: list[list[int]]
     copies: list[HcclCopyTask]
 
 
-class TransferPlanner:
-    """Keep stable local slots and transfer incoming experts with HCCL."""
+class ExpertUpdator:
+    """Execute prepared expert weight update tasks with HCCL."""
 
-    def plan(
-        self,
-        current_slots: list[list[int]],
-        target_slots: list[list[int]],
-    ) -> TransferPlan:
-        aligned = [
-            self._align_slots(current, target)
-            for current, target in zip(current_slots, target_slots)
-        ]
-        locations = {
-            expert_id: (rank, slot)
-            for rank, rank_slots in enumerate(current_slots)
-            for slot, expert_id in enumerate(rank_slots)
-        }
-        copies = [
-            HcclCopyTask(*locations[expert_id], rank, slot, expert_id)
-            for rank, rank_slots in enumerate(aligned)
-            for slot, expert_id in enumerate(rank_slots)
-            if current_slots[rank][slot] != expert_id
-        ]
-        return TransferPlan(aligned, copies)
-
-    def transfer(self, layer, plan: TransferPlan) -> None:
+    def transfer(self, layer, task: ExpertUpdateTask) -> None:
         ops: list[dist.P2POp] = []
         send_tensors: list[torch.Tensor] = []
         recv_bundles: list[tuple[int, dict[str, torch.Tensor]]] = []
-        for task in plan.copies:
-            if task.target_rank == layer.ep_rank:
+        for copy_task in task.copies:
+            if copy_task.target_rank == layer.ep_rank:
                 bundle = self._empty_expert_slot_like(layer)
-                recv_bundles.append((task.target_slot, bundle))
+                recv_bundles.append((copy_task.target_slot, bundle))
                 ops.extend(
-                    dist.P2POp(dist.irecv, tensor, task.source_rank)
+                    dist.P2POp(dist.irecv, tensor, copy_task.source_rank)
                     for tensor in bundle.values())
-            if task.source_rank == layer.ep_rank:
-                for tensor in self._expert_slot(layer,
-                                                task.source_slot).values():
+            if copy_task.source_rank == layer.ep_rank:
+                for tensor in self._expert_slot(
+                        layer, copy_task.source_slot).values():
                     tensor = tensor.clone()
                     send_tensors.append(tensor)
                     ops.append(
-                        dist.P2POp(dist.isend, tensor, task.target_rank))
+                        dist.P2POp(dist.isend, tensor,
+                                   copy_task.target_rank))
 
-        for request in dist.batch_isend_irecv(ops):
-            request.wait()
+        if ops:
+            for request in dist.batch_isend_irecv(ops):
+                request.wait()
         with torch.no_grad():
             for target_slot, tensors in recv_bundles:
                 self._write_expert_slot(layer, target_slot, tensors)
-
-    @staticmethod
-    def _align_slots(current: list[int], target: list[int]) -> list[int]:
-        target_set = set(target)
-        incoming = iter(expert_id for expert_id in target
-                        if expert_id not in current)
-        return [
-            expert_id if expert_id in target_set else next(incoming)
-            for expert_id in current
-        ]
 
     @classmethod
     def _empty_expert_slot_like(cls, layer) -> dict[str, torch.Tensor]:
