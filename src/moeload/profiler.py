@@ -23,6 +23,7 @@ class ExpertLoadProfiler:
         self._counts: dict[int, torch.Tensor] = {}
         self._last_load_snapshot: dict[int, torch.Tensor] = {}
         self._local_to_global: dict[int, torch.Tensor] = {}
+        self._local_map_values: dict[int, tuple[int, ...]] = {}
         self._device_slot_maps: dict[
             tuple[int, str, tuple[int, ...]], torch.Tensor] = {}
         self._metadata = dict(metadata or {})
@@ -62,8 +63,11 @@ class ExpertLoadProfiler:
         layer_id = layer.moe_instance_id
         if slot_to_global is None:
             slot_to_global = self._slot_to_global_from_lookup(layer)
-        self._local_to_global[layer_id] = torch.as_tensor(
+        cpu_slot_map = torch.as_tensor(
             slot_to_global, dtype=torch.long, device="cpu").clone()
+        self._local_to_global[layer_id] = cpu_slot_map
+        self._local_map_values[layer_id] = tuple(
+            int(value) for value in cpu_slot_map.tolist())
 
     def record_expert_tokens(
         self,
@@ -76,6 +80,7 @@ class ExpertLoadProfiler:
             expert_tokens,
             group_list_type,
             self._local_to_global[layer_id],
+            self._local_map_values[layer_id],
         )
 
     def record_slot_tokens(
@@ -84,6 +89,7 @@ class ExpertLoadProfiler:
         expert_tokens: torch.Tensor,
         group_list_type: int,
         slot_to_global: torch.Tensor,
+        map_values: tuple[int, ...] | None = None,
     ) -> None:
         if expert_tokens.numel() == 0:
             return
@@ -100,11 +106,22 @@ class ExpertLoadProfiler:
             counts = counts.to(device=device, non_blocking=True)
             self._counts[layer_id] = counts
 
-        cpu_slot_map = slot_to_global.to(device="cpu", dtype=torch.long)
-        map_values = tuple(int(value) for value in cpu_slot_map.tolist())
+        cpu_slot_map = None
+        if map_values is None:
+            local_map = self._local_to_global.get(layer_id)
+            if slot_to_global is local_map:
+                map_values = self._local_map_values[layer_id]
+            else:
+                cpu_slot_map = slot_to_global.to(device="cpu",
+                                                 dtype=torch.long)
+                map_values = tuple(
+                    int(value) for value in cpu_slot_map.tolist())
         map_key = (layer_id, str(device), map_values)
         device_slot_map = self._device_slot_maps.get(map_key)
         if device_slot_map is None:
+            if cpu_slot_map is None:
+                cpu_slot_map = torch.as_tensor(
+                    map_values, dtype=torch.long, device="cpu")
             device_slot_map = cpu_slot_map.to(device=device,
                                               non_blocking=True)
             self._device_slot_maps[map_key] = device_slot_map

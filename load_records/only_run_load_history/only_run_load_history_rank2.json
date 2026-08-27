@@ -3,530 +3,397 @@
     "0": {
       "experts": [
         {
-          "activated_tokens": 83693,
+          "activated_tokens": 68,
           "expert_id": 64
         },
         {
-          "activated_tokens": 96336,
+          "activated_tokens": 116,
           "expert_id": 65
         },
         {
-          "activated_tokens": 77984,
+          "activated_tokens": 81,
           "expert_id": 66
         },
         {
-          "activated_tokens": 104158,
+          "activated_tokens": 95,
           "expert_id": 67
         },
         {
-          "activated_tokens": 66979,
+          "activated_tokens": 51,
           "expert_id": 68
         },
         {
-          "activated_tokens": 96665,
+          "activated_tokens": 89,
           "expert_id": 69
         },
         {
-          "activated_tokens": 68123,
+          "activated_tokens": 76,
           "expert_id": 70
         },
         {
-          "activated_tokens": 78696,
+          "activated_tokens": 74,
           "expert_id": 71
         },
         {
-          "activated_tokens": 92762,
+          "activated_tokens": 96,
           "expert_id": 72
         },
         {
-          "activated_tokens": 83525,
+          "activated_tokens": 112,
           "expert_id": 73
         },
         {
-          "activated_tokens": 29377,
+          "activated_tokens": 19,
           "expert_id": 74
         },
         {
-          "activated_tokens": 95244,
+          "activated_tokens": 72,
           "expert_id": 75
         },
         {
-          "activated_tokens": 52273,
+          "activated_tokens": 46,
           "expert_id": 76
         },
         {
-          "activated_tokens": 131350,
+          "activated_tokens": 123,
           "expert_id": 77
         },
         {
-          "activated_tokens": 57010,
+          "activated_tokens": 38,
           "expert_id": 78
         },
         {
-          "activated_tokens": 31331,
+          "activated_tokens": 18,
           "expert_id": 79
         },
         {
-          "activated_tokens": 78157,
+          "activated_tokens": 79,
           "expert_id": 80
         },
         {
-          "activated_tokens": 86525,
+          "activated_tokens": 82,
           "expert_id": 81
         },
         {
-          "activated_tokens": 63679,
+          "activated_tokens": 48,
           "expert_id": 82
         },
         {
-          "activated_tokens": 81437,
+          "activated_tokens": 76,
           "expert_id": 83
         },
         {
-          "activated_tokens": 79876,
+          "activated_tokens": 68,
           "expert_id": 84
         },
         {
-          "activated_tokens": 23275,
+          "activated_tokens": 13,
           "expert_id": 85
         },
         {
-          "activated_tokens": 78828,
+          "activated_tokens": 78,
           "expert_id": 86
         },
         {
-          "activated_tokens": 107489,
+          "activated_tokens": 104,
           "expert_id": 87
         },
         {
-          "activated_tokens": 39654,
+          "activated_tokens": 20,
           "expert_id": 88
         },
         {
-          "activated_tokens": 40300,
+          "activated_tokens": 37,
           "expert_id": 89
         },
         {
-          "activated_tokens": 2747,
+          "activated_tokens": 1,
           "expert_id": 90
         },
         {
-          "activated_tokens": 84586,
+          "activated_tokens": 71,
           "expert_id": 91
         },
         {
-          "activated_tokens": 61764,
+          "activated_tokens": 44,
           "expert_id": 92
         },
         {
-          "activated_tokens": 109879,
+          "activated_tokens": 106,
           "expert_id": 93
         },
         {
-          "activated_tokens": 22468,
+          "activated_tokens": 9,
           "expert_id": 94
         },
         {
-          "activated_tokens": 107884,
+          "activated_tokens": 93,
           "expert_id": 95
         }
       ],
       "num_experts": 128
     },
-    "12": {
+    "16": {
       "experts": [
         {
-          "activated_tokens": 45850,
+          "activated_tokens": 32,
           "expert_id": 64
         },
         {
-          "activated_tokens": 55957,
+          "activated_tokens": 163,
           "expert_id": 65
         },
         {
-          "activated_tokens": 26972,
+          "activated_tokens": 10,
           "expert_id": 66
         },
         {
-          "activated_tokens": 84977,
+          "activated_tokens": 153,
           "expert_id": 67
         },
         {
-          "activated_tokens": 193643,
+          "activated_tokens": 57,
           "expert_id": 68
         },
         {
-          "activated_tokens": 103134,
+          "activated_tokens": 12,
           "expert_id": 69
         },
         {
-          "activated_tokens": 1891,
+          "activated_tokens": 12,
           "expert_id": 70
         },
         {
-          "activated_tokens": 215167,
+          "activated_tokens": 10,
           "expert_id": 71
         },
         {
-          "activated_tokens": 64475,
+          "activated_tokens": 6,
           "expert_id": 72
         },
         {
-          "activated_tokens": 99116,
+          "activated_tokens": 157,
           "expert_id": 73
         },
         {
-          "activated_tokens": 91325,
+          "activated_tokens": 3,
           "expert_id": 74
         },
         {
-          "activated_tokens": 84621,
+          "activated_tokens": 58,
           "expert_id": 75
         },
         {
-          "activated_tokens": 116911,
+          "activated_tokens": 60,
           "expert_id": 76
         },
         {
-          "activated_tokens": 13735,
+          "activated_tokens": 166,
           "expert_id": 77
         },
         {
-          "activated_tokens": 23901,
+          "activated_tokens": 69,
           "expert_id": 78
         },
         {
-          "activated_tokens": 105002,
+          "activated_tokens": 51,
           "expert_id": 79
         },
         {
-          "activated_tokens": 94453,
+          "activated_tokens": 137,
           "expert_id": 80
         },
         {
-          "activated_tokens": 60249,
+          "activated_tokens": 103,
           "expert_id": 81
         },
         {
-          "activated_tokens": 135512,
+          "activated_tokens": 6,
           "expert_id": 82
         },
         {
-          "activated_tokens": 16130,
+          "activated_tokens": 280,
           "expert_id": 83
         },
         {
-          "activated_tokens": 10479,
+          "activated_tokens": 335,
           "expert_id": 84
         },
         {
-          "activated_tokens": 71817,
+          "activated_tokens": 47,
           "expert_id": 85
         },
         {
-          "activated_tokens": 42487,
+          "activated_tokens": 3,
           "expert_id": 86
         },
         {
-          "activated_tokens": 99394,
+          "activated_tokens": 4,
           "expert_id": 87
         },
         {
-          "activated_tokens": 42934,
+          "activated_tokens": 2,
           "expert_id": 88
         },
         {
-          "activated_tokens": 54326,
+          "activated_tokens": 161,
           "expert_id": 89
         },
         {
-          "activated_tokens": 39355,
+          "activated_tokens": 21,
           "expert_id": 90
         },
         {
-          "activated_tokens": 25249,
+          "activated_tokens": 82,
           "expert_id": 91
         },
         {
-          "activated_tokens": 30572,
+          "activated_tokens": 18,
           "expert_id": 92
         },
         {
-          "activated_tokens": 4502,
+          "activated_tokens": 70,
           "expert_id": 93
         },
         {
-          "activated_tokens": 44838,
+          "activated_tokens": 88,
           "expert_id": 94
         },
         {
-          "activated_tokens": 112573,
+          "activated_tokens": 6,
           "expert_id": 95
         }
       ],
       "num_experts": 128
     },
-    "24": {
+    "32": {
       "experts": [
         {
-          "activated_tokens": 46017,
+          "activated_tokens": 81,
           "expert_id": 64
         },
         {
-          "activated_tokens": 83319,
+          "activated_tokens": 117,
           "expert_id": 65
         },
         {
-          "activated_tokens": 23316,
+          "activated_tokens": 71,
           "expert_id": 66
         },
         {
-          "activated_tokens": 107923,
+          "activated_tokens": 43,
           "expert_id": 67
         },
         {
-          "activated_tokens": 153639,
+          "activated_tokens": 32,
           "expert_id": 68
         },
         {
-          "activated_tokens": 85922,
+          "activated_tokens": 26,
           "expert_id": 69
         },
         {
-          "activated_tokens": 10259,
+          "activated_tokens": 18,
           "expert_id": 70
         },
         {
-          "activated_tokens": 93092,
+          "activated_tokens": 13,
           "expert_id": 71
         },
         {
-          "activated_tokens": 56019,
+          "activated_tokens": 11,
           "expert_id": 72
         },
         {
-          "activated_tokens": 187472,
+          "activated_tokens": 16,
           "expert_id": 73
         },
         {
-          "activated_tokens": 79296,
+          "activated_tokens": 21,
           "expert_id": 74
         },
         {
-          "activated_tokens": 128621,
+          "activated_tokens": 6,
           "expert_id": 75
         },
         {
-          "activated_tokens": 119489,
+          "activated_tokens": 4,
           "expert_id": 76
         },
         {
-          "activated_tokens": 8122,
+          "activated_tokens": 18,
           "expert_id": 77
         },
         {
-          "activated_tokens": 32538,
+          "activated_tokens": 8,
           "expert_id": 78
         },
         {
-          "activated_tokens": 112506,
+          "activated_tokens": 29,
           "expert_id": 79
         },
         {
-          "activated_tokens": 92486,
+          "activated_tokens": 184,
           "expert_id": 80
         },
         {
-          "activated_tokens": 67995,
+          "activated_tokens": 21,
           "expert_id": 81
         },
         {
-          "activated_tokens": 165738,
+          "activated_tokens": 181,
           "expert_id": 82
         },
         {
-          "activated_tokens": 13864,
+          "activated_tokens": 9,
           "expert_id": 83
         },
         {
-          "activated_tokens": 11300,
+          "activated_tokens": 136,
           "expert_id": 84
         },
         {
-          "activated_tokens": 63448,
+          "activated_tokens": 19,
           "expert_id": 85
         },
         {
-          "activated_tokens": 45841,
+          "activated_tokens": 198,
           "expert_id": 86
         },
         {
-          "activated_tokens": 90220,
+          "activated_tokens": 18,
           "expert_id": 87
         },
         {
-          "activated_tokens": 52767,
+          "activated_tokens": 48,
           "expert_id": 88
         },
         {
-          "activated_tokens": 47939,
+          "activated_tokens": 27,
           "expert_id": 89
         },
         {
-          "activated_tokens": 47964,
+          "activated_tokens": 77,
           "expert_id": 90
         },
         {
-          "activated_tokens": 21483,
+          "activated_tokens": 36,
           "expert_id": 91
         },
         {
-          "activated_tokens": 33174,
+          "activated_tokens": 3,
           "expert_id": 92
         },
         {
-          "activated_tokens": 3364,
+          "activated_tokens": 68,
           "expert_id": 93
         },
         {
-          "activated_tokens": 53048,
+          "activated_tokens": 91,
           "expert_id": 94
         },
         {
-          "activated_tokens": 129195,
-          "expert_id": 95
-        }
-      ],
-      "num_experts": 128
-    },
-    "36": {
-      "experts": [
-        {
-          "activated_tokens": 40048,
-          "expert_id": 64
-        },
-        {
-          "activated_tokens": 102735,
-          "expert_id": 65
-        },
-        {
-          "activated_tokens": 25069,
-          "expert_id": 66
-        },
-        {
-          "activated_tokens": 89992,
-          "expert_id": 67
-        },
-        {
-          "activated_tokens": 191138,
-          "expert_id": 68
-        },
-        {
-          "activated_tokens": 103943,
-          "expert_id": 69
-        },
-        {
-          "activated_tokens": 2875,
-          "expert_id": 70
-        },
-        {
-          "activated_tokens": 83323,
-          "expert_id": 71
-        },
-        {
-          "activated_tokens": 62432,
-          "expert_id": 72
-        },
-        {
-          "activated_tokens": 251753,
-          "expert_id": 73
-        },
-        {
-          "activated_tokens": 87540,
-          "expert_id": 74
-        },
-        {
-          "activated_tokens": 83307,
-          "expert_id": 75
-        },
-        {
-          "activated_tokens": 147674,
-          "expert_id": 76
-        },
-        {
-          "activated_tokens": 7114,
-          "expert_id": 77
-        },
-        {
-          "activated_tokens": 36171,
-          "expert_id": 78
-        },
-        {
-          "activated_tokens": 100677,
-          "expert_id": 79
-        },
-        {
-          "activated_tokens": 95865,
-          "expert_id": 80
-        },
-        {
-          "activated_tokens": 68880,
-          "expert_id": 81
-        },
-        {
-          "activated_tokens": 153122,
-          "expert_id": 82
-        },
-        {
-          "activated_tokens": 15902,
-          "expert_id": 83
-        },
-        {
-          "activated_tokens": 12987,
-          "expert_id": 84
-        },
-        {
-          "activated_tokens": 75707,
-          "expert_id": 85
-        },
-        {
-          "activated_tokens": 53112,
-          "expert_id": 86
-        },
-        {
-          "activated_tokens": 90352,
-          "expert_id": 87
-        },
-        {
-          "activated_tokens": 57446,
-          "expert_id": 88
-        },
-        {
-          "activated_tokens": 37294,
-          "expert_id": 89
-        },
-        {
-          "activated_tokens": 34209,
-          "expert_id": 90
-        },
-        {
-          "activated_tokens": 22092,
-          "expert_id": 91
-        },
-        {
-          "activated_tokens": 88489,
-          "expert_id": 92
-        },
-        {
-          "activated_tokens": 4231,
-          "expert_id": 93
-        },
-        {
-          "activated_tokens": 58599,
-          "expert_id": 94
-        },
-        {
-          "activated_tokens": 98029,
+          "activated_tokens": 81,
           "expert_id": 95
         }
       ],
@@ -537,11 +404,10 @@
     "rank": 2,
     "runtime_layer_ids": [
       0,
-      12,
-      24,
-      36
+      16,
+      32
     ],
-    "runtime_mode": "offload"
+    "runtime_mode": "balance"
   },
   "version": 2
 }

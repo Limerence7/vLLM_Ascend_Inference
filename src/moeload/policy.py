@@ -178,25 +178,33 @@ class ExpertPolicy:
             expert_ids = list(range(num_experts))
         if ep_size * slots_per_rank < len(expert_ids):
             raise ValueError("not enough slots to place every expert.")
+        if slots_per_rank > len(expert_ids):
+            raise ValueError(
+                "slots_per_rank cannot exceed the number of candidate experts.")
 
         load = _load_tensor(counts, num_experts)
         slots: list[list[int]] = [[] for _ in range(ep_size)]
         rank_loads = [0.0] * ep_size
         ranked = ranked_experts_by_load(load, expert_ids)
+        expert_ranks: dict[int, list[int]] = {}
 
         for expert_id in ranked:
             rank = _lightest_rank(slots, rank_loads, slots_per_rank)
             slots[rank].append(expert_id)
             rank_loads[rank] += float(load[expert_id])
+            expert_ranks.setdefault(int(expert_id), []).append(rank)
 
-        replica_index = 0
         while any(len(rank_slots) < slots_per_rank for rank_slots in slots):
-            expert_id = ranked[replica_index % len(ranked)]
-            rank = _lightest_rank(
-                slots, rank_loads, slots_per_rank, exclude=expert_id)
+            rank, expert_id, rank_loads = _best_replica_placement(
+                slots=slots,
+                rank_loads=rank_loads,
+                expert_ranks=expert_ranks,
+                ranked_experts=ranked,
+                load=load,
+                slots_per_rank=slots_per_rank,
+            )
             slots[rank].append(expert_id)
-            rank_loads[rank] += float(load[expert_id])
-            replica_index += 1
+            expert_ranks.setdefault(int(expert_id), []).append(rank)
 
         return slots
 
@@ -319,6 +327,67 @@ def _lightest_rank(
         ]
     return min(candidates, key=lambda rank:
                (rank_loads[rank], len(slots[rank]), rank))
+
+
+def _best_replica_placement(
+    slots: list[list[int]],
+    rank_loads: list[float],
+    expert_ranks: dict[int, list[int]],
+    ranked_experts: list[int],
+    load: torch.Tensor,
+    slots_per_rank: int,
+) -> tuple[int, int, list[float]]:
+    best: tuple[tuple[float, float, float, int, int], int, int, list[float]]
+    best = ((float("inf"), float("inf"), float("inf"), -1, -1), -1, -1, [])
+    for expert_id in ranked_experts:
+        holders = expert_ranks.get(int(expert_id), [])
+        candidate_ranks = [
+            rank for rank, rank_slots in enumerate(slots)
+            if len(rank_slots) < slots_per_rank and expert_id not in rank_slots
+        ]
+        for rank in candidate_ranks:
+            projected = _rank_loads_after_replica(
+                rank_loads, holders, rank, float(load[expert_id]))
+            score = _rank_load_score(projected, len(slots[rank]), expert_id)
+            if score < best[0]:
+                best = (score, rank, int(expert_id), projected)
+    if best[1] < 0:
+        raise ValueError("unable to place a replica without duplicate rank slots.")
+    return best[1], best[2], best[3]
+
+
+def _rank_loads_after_replica(
+    rank_loads: list[float],
+    current_holders: list[int],
+    target_rank: int,
+    expert_load: float,
+) -> list[float]:
+    old_replicas = len(current_holders)
+    if old_replicas <= 0:
+        projected = list(rank_loads)
+        projected[target_rank] += expert_load
+        return projected
+
+    old_share = expert_load / old_replicas
+    new_share = expert_load / (old_replicas + 1)
+    projected = list(rank_loads)
+    for rank in current_holders:
+        projected[rank] -= old_share
+        projected[rank] += new_share
+    projected[target_rank] += new_share
+    return projected
+
+
+def _rank_load_score(
+    rank_loads: list[float],
+    target_slot_count: int,
+    expert_id: int,
+) -> tuple[float, float, float, int, int]:
+    max_load = max(rank_loads)
+    min_load = min(rank_loads)
+    ratio = float("inf") if min_load <= 0 else max_load / min_load
+    spread = max_load - min_load
+    return (ratio, spread, max_load, target_slot_count, expert_id)
 
 
 def _physical_slots_by_expert(

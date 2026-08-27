@@ -5,6 +5,25 @@ from collections import deque
 from typing import Any, Deque, Optional, Set
 
 
+_VALID_POLICIES = ("fifo", "throughput", "expert")
+_HINT_NAMES = (
+    "vllm_ascend_expert_cost",
+    "expert_cost",
+    "scheduler_cost",
+    "priority",
+)
+_HINT_CONTAINER_NAMES = (
+    "metadata",
+    "extra_args",
+    "extra_body",
+    "request_metadata",
+)
+_HINT_SOURCE_NAMES = (
+    "metrics",
+    "sampling_params",
+    "request_metadata",
+    "metadata",
+)
 _PATCHED = False
 _MIN_STEP_TOKENS = 2000
 _REORDER_WINDOW = 64
@@ -33,9 +52,7 @@ def apply_offline_scheduler_patch(
 
     _MIN_STEP_TOKENS = max(0, int(min_step_tokens))
     _REORDER_WINDOW = max(1, int(reorder_window))
-    _SCHEDULER_POLICY = str(policy).strip().lower()
-    if _SCHEDULER_POLICY not in ("fifo", "throughput", "expert"):
-        _SCHEDULER_POLICY = "expert"
+    _SCHEDULER_POLICY = _normalize_scheduler_policy(policy)
 
     if _PATCHED:
         return
@@ -86,26 +103,31 @@ def _apply_v1_marker_patch() -> None:
 
 
 def _get_min_step_tokens(scheduler_config) -> int:
-    return int(
-        getattr(
-            scheduler_config,
-            "scheduler_min_step_tokens",
-            getattr(scheduler_config, "min_step_tokens", _MIN_STEP_TOKENS),
-        ))
-
-
-def _get_reorder_window(scheduler_config) -> int:
     return max(
-        1,
-        int(getattr(scheduler_config, "scheduler_reorder_window",
-                    _REORDER_WINDOW)),
+        0,
+        int(
+            getattr(
+                scheduler_config,
+                "scheduler_min_step_tokens",
+                getattr(scheduler_config, "min_step_tokens",
+                        _MIN_STEP_TOKENS),
+            )),
     )
 
 
+def _get_reorder_window(scheduler_config) -> int:
+    return max(1, int(getattr(scheduler_config, "scheduler_reorder_window",
+                              _REORDER_WINDOW)))
+
+
 def _get_scheduler_policy(scheduler_config) -> str:
-    policy = str(getattr(scheduler_config, "scheduler_policy",
-                         _SCHEDULER_POLICY)).strip().lower()
-    return policy if policy in ("fifo", "throughput", "expert") else "expert"
+    return _normalize_scheduler_policy(
+        getattr(scheduler_config, "scheduler_policy", _SCHEDULER_POLICY))
+
+
+def _normalize_scheduler_policy(policy: Any) -> str:
+    policy = str(policy).strip().lower()
+    return policy if policy in _VALID_POLICIES else "expert"
 
 
 def _record_scheduler_output(scheduler_outputs, scheduler_config) -> None:
@@ -125,11 +147,15 @@ def _maybe_reorder_waiting(self) -> None:
         return
 
     window = min(len(self.waiting), _get_reorder_window(self.scheduler_config))
-    candidates = [(index, self.waiting.popleft()) for index in range(window)]
+    candidates = _pop_reorder_window(self.waiting, window)
     candidates.sort(key=lambda item: _scheduler_key(item[1], item[0], policy))
 
     for _, seq_group in reversed(candidates):
         self.waiting.appendleft(seq_group)
+
+
+def _pop_reorder_window(waiting: Deque, window: int) -> list[tuple[int, Any]]:
+    return [(index, waiting.popleft()) for index in range(window)]
 
 
 def _scheduler_key(seq_group, index: int, policy: str) -> tuple:
@@ -144,10 +170,7 @@ def _scheduler_key(seq_group, index: int, policy: str) -> tuple:
 
 
 def _estimate_prompt_tokens(seq_group) -> int:
-    try:
-        waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
-    except Exception:
-        waiting_seqs = []
+    waiting_seqs = _waiting_seqs(seq_group)
     seq = waiting_seqs[0] if waiting_seqs else seq_group
 
     for name in ("get_len", "get_prompt_len", "get_num_new_tokens"):
@@ -168,30 +191,43 @@ def _estimate_prompt_tokens(seq_group) -> int:
 
 
 def _expert_cost_hint(seq_group) -> float | None:
-    for obj in _hint_sources(seq_group):
+    for obj in _iter_hint_sources(seq_group):
         value = _read_hint_value(obj)
         if value is not None:
             return value
     return None
 
 
-def _hint_sources(seq_group) -> list[Any]:
-    sources: list[Any] = [seq_group]
-    for name in ("metrics", "sampling_params", "request_metadata"):
-        value = getattr(seq_group, name, None)
+def _iter_hint_sources(seq_group):
+    yield seq_group
+    for seq in _waiting_seqs(seq_group):
+        yield seq
+    for name in _HINT_SOURCE_NAMES:
+        source = getattr(seq_group, name, None)
+        if source is not None:
+            yield source
+            yield from _iter_hint_containers(source)
+
+
+def _iter_hint_containers(source):
+    for name in _HINT_CONTAINER_NAMES:
+        if isinstance(source, dict):
+            value = source.get(name)
+        else:
+            value = getattr(source, name, None)
         if value is not None:
-            sources.append(value)
-    return sources
+            yield value
+
+
+def _waiting_seqs(seq_group) -> list[Any]:
+    try:
+        return list(seq_group.get_seqs(status=SequenceStatus.WAITING))
+    except Exception:
+        return []
 
 
 def _read_hint_value(source: Any) -> float | None:
-    names = (
-        "vllm_ascend_expert_cost",
-        "expert_cost",
-        "scheduler_cost",
-        "priority",
-    )
-    for name in names:
+    for name in _HINT_NAMES:
         if isinstance(source, dict):
             value = source.get(name)
         else:
@@ -240,7 +276,7 @@ def _schedule_prefills_offline(
                 SequenceStatus.WAITING,
                 enable_chunking,
                 budget,
-                partial_prefill_metadata=None,
+                partial_prefill_metadata=partial_prefill_metadata,
             ))
         num_new_tokens = num_new_tokens_uncached + num_new_tokens_cached
 
@@ -372,14 +408,14 @@ def _schedule_chunked_prefill_offline(self):
     )
 
     def count_prefill_tokens() -> int:
-        return sum(s.token_chunk_size for s in prefills.seq_groups) + sum(
-            s.token_chunk_size
-            for s in running_scheduled.prefill_seq_groups) + sum(
-                s.token_chunk_size for s in swapped_in.prefill_seq_groups)
+        return (
+            _count_token_chunks(prefills.seq_groups) +
+            _count_token_chunks(running_scheduled.prefill_seq_groups) +
+            _count_token_chunks(swapped_in.prefill_seq_groups))
 
-    decode_tokens_total = sum(
-        s.token_chunk_size for s in running_scheduled.decode_seq_groups) + sum(
-            s.token_chunk_size for s in swapped_in.decode_seq_groups)
+    decode_tokens_total = (
+        _count_token_chunks(running_scheduled.decode_seq_groups) +
+        _count_token_chunks(swapped_in.decode_seq_groups))
 
     min_step_tokens = _get_min_step_tokens(self.scheduler_config)
     prefill_tokens_total = count_prefill_tokens()
@@ -392,10 +428,9 @@ def _schedule_chunked_prefill_offline(self):
             enable_chunking=True,
             partial_prefill_metadata=partial_prefill_metadata,
         )
+        _append_prefill_outputs(prefills, extra_prefills)
         if not extra_prefills.seq_groups:
             break
-        prefills.seq_groups.extend(extra_prefills.seq_groups)
-        prefills.ignored_seq_groups.extend(extra_prefills.ignored_seq_groups)
         prefill_tokens_total = count_prefill_tokens()
 
     assert budget.num_batched_tokens <= (
@@ -444,3 +479,12 @@ def _schedule_chunked_prefill_offline(self):
     )
     _record_scheduler_output(scheduler_outputs, self.scheduler_config)
     return scheduler_outputs
+
+
+def _count_token_chunks(scheduled_groups) -> int:
+    return sum(group.token_chunk_size for group in scheduled_groups)
+
+
+def _append_prefill_outputs(target, extra) -> None:
+    target.seq_groups.extend(extra.seq_groups)
+    target.ignored_seq_groups.extend(extra.ignored_seq_groups)

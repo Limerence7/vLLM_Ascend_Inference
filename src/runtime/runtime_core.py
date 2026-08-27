@@ -16,6 +16,7 @@ class RuntimeCore:
     _profiler: ExpertLoadProfiler | None = None
     _memory_manager: ExpertMemoryManager | None = None
     _policy: ExpertPolicy | None = None
+    _forward_steps: dict[int, int] = {}
 
     @property
     def executor(self) -> ExoExecutor | None:
@@ -42,6 +43,7 @@ class RuntimeCore:
         cls._profiler = None
         cls._memory_manager = None
         cls._policy = None
+        cls._forward_steps = {}
 
     def __init__(self, config: RuntimeConfig, uses_w8a8: bool):
         self.config = config
@@ -57,12 +59,11 @@ class RuntimeCore:
             RuntimeCore._policy = ExpertPolicy(config.load_history_path)
 
         if config.uses_runtime_core:
-            if RuntimeCore._memory_manager is None:
+            if config.uses_cold_buffer and RuntimeCore._memory_manager is None:
                 RuntimeCore._memory_manager = ExpertMemoryManager(
                     cpu_pin_memory=config.cpu_pin_memory,
                 )
             if RuntimeCore._executor is None:
-                assert RuntimeCore._memory_manager is not None
                 RuntimeCore._executor = ExoExecutor(
                     config, uses_w8a8, RuntimeCore._memory_manager)
 
@@ -99,12 +100,6 @@ class RuntimeCore:
                 f"{len(local_expert_map)} local expert slots, but "
                 f"offload_count is {self.config.offload_count}.")
         hot_count = len(local_expert_map) - self.config.offload_count
-        if self.config.runtime_mode == "offload":
-            global_load = (
-                self.policy.history_load(layer)
-                if self.config.enable_history_mapping else None)
-            return (self.policy.offload_expert_map(
-                local_expert_map, hot_count, global_load), hot_count)
         global_load = (
             self.policy.history_load(layer)
             if self.config.enable_history_mapping else None)
@@ -120,9 +115,23 @@ class RuntimeCore:
         return (self.config.uses_cold_buffer
                 and self.should_manage_layer(layer))
 
-    @property
-    def collect_load(self) -> bool:
-        return bool(self.executor is not None and self.executor.collect_load)
+    def begin_forward_collect(self, layer) -> bool:
+        if not self.config.needs_load_collection:
+            return False
+
+        layer_id = int(layer.moe_instance_id)
+        step = RuntimeCore._forward_steps.get(layer_id, 0) + 1
+        RuntimeCore._forward_steps[layer_id] = step
+
+        if self.config.runtime_mode == "profile":
+            return True
+        if not self.config.needs_dynamic_rebalance:
+            return step % int(self.config.load_collect_interval) == 0
+        if not self.should_manage_layer(layer):
+            return False
+        return (
+            step % int(self.config.load_collect_interval) == 0
+            or step % int(self.config.rebalance_interval) == 0)
 
     def register_layer(self, layer, expert_map: list[int]) -> None:
         self.profiler.register_layer(layer, expert_map)
@@ -170,18 +179,18 @@ class RuntimeCore:
 
     def record_expert_tokens(self, layer, group_list_type: int,
                              expert_tokens: torch.Tensor) -> None:
+        if not self.config.needs_load_collection:
+            return
         if (self.executor is not None
                 and not self.executor.should_manage_layer(layer)):
             self.profiler.record_expert_tokens(
                 int(layer.moe_instance_id), expert_tokens, group_list_type)
             return
-        if self.config.runtime_mode == "balance":
+        if self.config.needs_dynamic_rebalance:
             assert self.adaptor is not None
+            step = RuntimeCore._forward_steps.get(int(layer.moe_instance_id), 0)
             self.adaptor.record_expert_tokens(layer, group_list_type,
-                                              expert_tokens)
-        elif self.config.runtime_mode == "offload":
-            self.profiler.record_expert_tokens(
-                int(layer.moe_instance_id), expert_tokens, group_list_type)
+                                              expert_tokens, step)
         else:
             self.profiler.record_expert_tokens(
                 int(layer.moe_instance_id), expert_tokens, group_list_type)
@@ -193,6 +202,14 @@ class RuntimeCore:
         expert_tokens: torch.Tensor,
         slot_to_global: torch.Tensor,
     ) -> None:
+        if not self.config.needs_load_collection:
+            return
+        if self.config.needs_dynamic_rebalance:
+            assert self.adaptor is not None
+            step = RuntimeCore._forward_steps.get(int(layer.moe_instance_id), 0)
+            self.adaptor.record_slot_expert_tokens(
+                layer, group_list_type, expert_tokens, slot_to_global, step)
+            return
         self.profiler.record_slot_tokens(
             int(layer.moe_instance_id), expert_tokens, group_list_type,
             slot_to_global)

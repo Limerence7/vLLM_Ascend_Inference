@@ -7,17 +7,17 @@
 Runtime 面向三类互斥运行模式：
 
 * `profile`：专家负载统计模式。模型保持原生 vLLM-Ascend MoE 计算路径，仅记录专家访问频率、激活 token 数和负载变化，不调整专家映射，不执行 CPU/NPU 参数传输。
-* `offload`：专家部分卸载模式。NPU 只保留一部分运行时专家和 cold buffer，CPU 保存本 rank cold experts；forward 时把 hot experts 和已换入的 cold experts 作为统一专家列表计算。
+* `offload`：专家卸载模式。NPU 保留运行时 hot experts 和 cold buffer，CPU 保存本 rank cold experts；支持单卡专家全卸载，forward 时把 hot experts 和已换入的 cold experts 作为统一专家列表计算。
 * `balance`：专家负载均衡模式。Runtime 根据全局负载动态调整 NPU 上的常驻专家分布，可使用冗余专家实现全局负载均衡。
 
 核心原则：
 
 * `runtime_mode` 只允许为 `profile`、`offload`、`balance`。
 * `num_runtime_experts` 决定 Runtime 专家布局和执行语义。
-* `num_runtime_experts < 0` 表示每卡减少的 NPU 常驻专家数量，并创建对应 cold buffer。
+* `num_runtime_experts < 0` 表示每卡减少的 NPU 常驻专家数量，并创建对应 cold buffer；可减少到 0 个常驻专家。
 * `num_runtime_experts = 0` 表示不对专家进行卸载或冗余，等价于保持原生专家常驻布局。
 * `num_runtime_experts > 0` 只允许在 `balance` 模式下使用，表示创建冗余专家 slot。
-* offload 模式不再提供冷热专家 split compute，也不额外修改 `topk_ids`、mask 或 token routing；专家排布自初始化后保持一致，通过 hot/cold weight list 拼接成完整本地专家视图。
+* offload 模式不再提供冷热专家 split compute，也不额外修改 `topk_ids`、mask 或 token routing；专家排布自初始化后保持一致，通过 hot/cold weight list 拼接成完整本地专家视图；全卸载时 hot list 为空。
 * `RuntimeAscendFusedMoE` 只负责模型层接管、权重创建和调用 Runtime Core，不直接持有 executor、memory manager 或 balance adaptor 的策略逻辑。
 * `runtime_core` 是 Runtime 执行中枢，负责创建并协调 `exo_executor`、`memory_manager` 和 `lbvc_adaptor`。
 * `lbvc_adaptor` 负责 balance 专家替换任务生成，`exp_updator` 负责接收任务并执行 HCCL 卡间互传。
@@ -60,6 +60,7 @@ vLLM_Ascend_Inference/
     ├── naive_run.py
     ├── runtime_dp_test.py
     ├── runtime_run.py
+    ├── test_balance_policy.py
     └── template.py
 ```
 
@@ -103,7 +104,7 @@ vLLM_Ascend_Inference/
 
 `num_runtime_experts` 语义：
 
-* `< 0`：每卡减少 `abs(num_runtime_experts)` 个 NPU 常驻 experts，并创建对应 cold buffer。
+* `< 0`：每卡减少 `abs(num_runtime_experts)` 个 NPU 常驻 experts，并创建对应 cold buffer；可减少到 0 个常驻 expert。
 * `= 0`：不进行专家卸载或冗余，NPU 专家布局与原生实现一致。
 * `> 0`：冗余专家数量。NPU 在原生常驻专家 slot 之外创建冗余 slot，用于全局负载均衡。
 
@@ -111,16 +112,30 @@ Profiler 与策略参数：
 
 * `load_history_path`：专家负载记录路径。
 * `enable_history_mapping`：是否读取历史负载并生成初始化专家映射。
-* `load_collect_interval`：每隔多少次推理统计一次专家负载。
+* `enable_load_collection`：非 `profile`、非 `balance` 模式下是否显式采样专家负载；用于 offload 生成历史记录，默认关闭以避免影响吞吐。
+* `load_collect_interval`：每隔多少次推理统计一次专家负载，balance 模式只在采样步或 rebalance 步开启统计。
 * `rebalance_interval`：每隔多少次推理尝试一次专家分布调整。
 * `policy_interval`：旧策略更新周期参数，作为 `rebalance_interval` 的兼容默认值。
 * `imbalance_threshold`：触发专家重映射或冗余加载的 rank 负载最高/最低比值阈值。
 * `enable_offline_scheduler`：是否启用离线调度 patch。
-* `min_step_tokens`：balance 调整前的最小统计 token 数，窗口内 token 太少时跳过重排。
+* `min_step_tokens`：兼容参数，作为 `scheduler_min_step_tokens` 和 `rebalance_min_step_tokens` 的默认值。
+* `scheduler_min_step_tokens`：离线请求调度每个 scheduler step 尽量达到的 token 数软下限。
+* `scheduler_reorder_window`：离线调度只在 waiting 队列前若干请求内做局部稳定重排，避免全局重排破坏公平性。
+* `scheduler_policy`：离线调度策略，可选 `fifo`、`throughput` 或 `expert`。
+* `rebalance_min_step_tokens`：balance 调整前的最小统计 token 数，窗口内 token 太少时跳过重排。
 
 Balance 参数：
 
 Balance 专家权重只通过 HCCL 在 rank 间互传；CPU-NPU 仅用于固定 cold experts。
+`runtime_mode = balance` 时动态负载均衡始终开启；Runtime 通过 `load_collect_interval` 降低观测成本，通过 `rebalance_interval`、`rebalance_min_step_tokens` 和 `imbalance_threshold` 控制实际专家迁移频率。
+
+请求调度参数：
+
+* `fifo`：保持 vLLM waiting 队列原始顺序，只保留原有 chunked prefill 填充逻辑。
+* `throughput`：在 `scheduler_reorder_window` 内优先调度 prompt token 数较多的请求，用于离线大 batch 场景下放大单 step token 数，摊薄 offload cold buffer 加载成本。
+* `expert`：优先读取请求上的轻量专家代价 hint，如 `vllm_ascend_expert_cost`、`expert_cost`、`scheduler_cost` 或 `priority`，代价低的请求先调度；没有 hint 时回退到 `throughput`。
+
+请求调度只依赖 vLLM `seq_group` 的请求属性和可选 metadata hint，不直接引用 `RuntimeCore`、`MemoryManager`、`ExoExecutor` 或 `LBVCAdaptor`，避免调度逻辑与专家卸载、专家迁移实现耦合。
 
 ## 5. 核心抽象
 
@@ -150,7 +165,7 @@ Balance 专家权重只通过 HCCL 在 rank 间互传；CPU-NPU 仅用于固定 
 * 管理 CPU pinned memory 选项。
 * 在 `offload` 或 `balance` 且 `num_runtime_experts < 0` 时，CPU 只保存本 rank 固定 cold experts，NPU 创建固定数量 cold buffer。
 * `ColdExperts` 维护可复用的 NPU cold buffer 参数；W8A8 权重以 per-expert list 形式保存，非量化权重以 tensor 保存。
-* `CombinedExperts` 是 forward-only 视图，把 layer 上的 hot expert weights 和 cold buffer weights 拼成一个完整 expert list，不复制权重主体。
+* `CombinedExperts` 是 forward-only 视图，把 layer 上的 hot expert weights 和 cold buffer weights 拼成一个完整 expert list，不复制权重主体；全卸载时 hot expert list 为空。
 * CPU 只保存固定 cold experts，不参与 balance 专家重分布；无 cold buffer 的 balance 不创建 CPU expert storage。
 
 ### `ExoExecutor`
@@ -163,7 +178,7 @@ Balance 专家权重只通过 HCCL 在 rank 间互传；CPU-NPU 仅用于固定 
 * 支持独立 NPU stream、event 同步和必要的流水线加载。
 * 管理每层 `expert_map`，其中前半部分为 hot experts，末尾为固定 cold experts。
 * 通过 `_full_expert_map()` 构建 `logical_expert_id -> physical_slot_id` 的完整映射。
-* `prepare_combined_experts()` 加载当前层 cold buffer，并返回 `PreparedCombinedExperts(CombinedExperts, expert_map, slot_to_global)`；offload 和带 cold buffer 的 balance 共用该路径。
+* `prepare_combined_experts()` 加载当前层 cold buffer，并返回 `PreparedCombinedExperts(CombinedExperts, expert_map, slot_to_global)`；offload 和带 cold buffer 的 balance 共用该路径，`expert_map` 和 `slot_to_global` 按层缓存并在 layout 更新后失效。
 * 不再维护 hot/cold routing maps，也不再生成 cold-only topk 或 mask。
 
 ### `ExpertUpdator`
@@ -190,6 +205,7 @@ Balance 专家权重只通过 HCCL 在 rank 间互传；CPU-NPU 仅用于固定 
 * 在 `enable_history_mapping = True` 时读取历史负载，调用 policy 生成初始化 expert map，并驱动 Runtime 初始化专家分布。
 * 按 `load_collect_interval` 控制负载统计频率，按 `rebalance_interval` 控制专家分布调整频率。
 * 每次调整前把 expert 负载按当前 slot 分布投影到 rank 负载；冗余副本按副本数均摊负载。
+* 策略生成冗余副本时使用相同的副本均摊模型，按目标 rank 负载比、负载差和最大负载选择副本位置。
 * 比较当前 rank 负载最高/最低比值，超过 `imbalance_threshold` 后触发全局专家重排。
 * `num_runtime_experts < 0` 时只调整每张卡前面的 resident 热专家，后面的 cold experts 始终固定。
 * `num_runtime_experts >= 0` 时对全部 NPU slots 做全局负载均衡。
@@ -207,7 +223,7 @@ Balance 专家权重只通过 HCCL 在 rank 间互传；CPU-NPU 仅用于固定 
 
 Profiler 只记录和输出负载，不决定专家映射。
 
-Profiler 统计在设备侧累加，避免 forward 每步同步到 CPU；保存历史或读取 delta 时才同步。
+Profiler 统计在设备侧累加，避免 forward 每步同步到 CPU；保存历史或读取 delta 时才同步。Profiler 缓存 layer 的 slot-to-global key 和设备侧映射，减少采样步重复转换。
 
 ### `Policy`
 
@@ -217,7 +233,7 @@ Profiler 统计在设备侧累加，避免 forward 每步同步到 CPU；保存�
 
 * 根据当前负载或历史负载计算 expert map。
 * 为 `offload` 模式提供 hot-first、cold-fixed 的初始 expert map。
-* 为 `balance` 模式提供全局专家重分布或冗余专家加载策略。
+* 为 `balance` 模式提供全局专家重分布或冗余专家加载策略，并保证目标分布的负载评估与运行期 rebalance 判断一致。
 * 只输出策略结果，不执行参数传输，不修改 Runtime 对象。
 
 ## 6. 计算层职责
@@ -236,7 +252,7 @@ Profiler 统计在设备侧累加，避免 forward 每步同步到 CPU；保存�
 不同配置下的权重布局：
 
 * `runtime_mode = profile`：保持原生专家布局和原生计算路径，只记录专家负载。
-* `num_runtime_experts < 0`：NPU 创建减少后的常驻专家 slots 和 cold buffer slots。
+* `num_runtime_experts < 0`：NPU 创建减少后的常驻专家 slots 和 cold buffer slots；常驻专家数可以为 0。
 * `num_runtime_experts = 0`：NPU 创建原生本地专家 slots，不启用专家迁移。
 * `num_runtime_experts > 0`：NPU 创建原生本地专家 slots 和 redundant slots；该模式不创建 CPU expert storage，冗余专家权重通过初始化加载或后续 HCCL 更新进入对应 slot。
 
@@ -251,6 +267,7 @@ Profiler 统计在设备侧累加，避免 forward 每步同步到 CPU；保存�
 * `offload` 或 `balance` 使用 cold buffer 时，调用 `RuntimeCore.prepare_combined_experts()` 得到 hot/cold 组合专家视图。
 * 对组合专家视图调用本地 `_runtime_fused_experts()`，保留原始 `topk_ids`、`topk_weights`、`mc2_mask`、`pertoken_scale`，不再构造冷热拆分 routing。
 * W8A8 路径使用 `w13_weight_list`、`w2_weight_list`、`w13_weight_scale_fp32_list`、`w2_weight_scale_list`；非量化路径使用 `w13_weight_list`、`w2_weight_list`。
+* 全卸载时跳过 0 expert 的原生权重后处理，直接处理 CPU cold weights，并向 combined experts 提供空 hot list。
 * combined experts 下，即使当前通信类型为 `FUSED_MC2`，也复用 MC2 token dispatch/combine，加本地 grouped matmul MLP，不调用 FUSED_MC2 的单 tensor FFN 融合算子。
 
 ### `layer/moe_mlp.py`
@@ -295,7 +312,7 @@ Profiler 统计在设备侧累加，避免 forward 每步同步到 CPU；保存�
 初始化流程：
 
 1. 初始化阶段根据 `num_runtime_experts` 计算每卡需要卸载的 cold experts。
-2. `create_weights` 只为 hot experts 创建常驻 NPU 参数。
+2. `create_weights` 只为 hot experts 创建常驻 NPU 参数；全卸载时 hot expert 数为 0。
 3. `RuntimeCore` 将专家权重交给 `MemoryManager`，CPU 只保存本 rank cold experts。
 4. `ExoExecutor` 创建 NPU cold buffer，数量由 `offload_count` 和 `num_buffers` 决定。
 5. 如果 `enable_history_mapping = True`，`Policy` 根据历史负载生成 hot-first expert map；否则使用默认本地专家顺序。
@@ -304,7 +321,7 @@ Forward 流程：
 
 1. 原生 expert selection 生成 `topk_ids` 和 `topk_weights`。
 2. `RuntimeCore.prepare_combined_experts()` 触发当前层 cold buffer 加载，并构建 `CombinedExperts`。
-3. `CombinedExperts` 将 hot expert list 和 cold buffer list 拼接为一个完整本地 expert list。
+3. `CombinedExperts` 将 hot expert list 和 cold buffer list 拼接为一个完整本地 expert list；全卸载时直接使用 cold expert list。
 4. `ExoExecutor` 提供完整 `expert_map`，token dispatcher 按原始 `topk_ids` 映射到 physical slot。
 5. `quant_method._runtime_fused_experts()` 调用 token dispatch。
 6. `moe_mlp.unified_apply_mlp()` 对完整 expert list 执行一次 grouped matmul MLP。
@@ -332,7 +349,7 @@ Offload 模式只更新 cold buffer 内容，不拆分冷热计算，不对 `top
 5. Forward 阶段按 `load_collect_interval` 将专家 token 统计写入 profiler。
 6. 按 `rebalance_interval` 读取 profiler delta，跨 EP rank 聚合当前窗口的全局 expert load。
 7. `LBVCAdaptor` 基于当前 slot 分布计算每个 rank 的负载，比较最高/最低负载比值。
-8. 如果窗口 token 数小于 `min_step_tokens`，或最高/最低比值不超过 `imbalance_threshold`，本轮不调整。
+8. 如果窗口 token 数小于 `rebalance_min_step_tokens`，或最高/最低比值不超过 `imbalance_threshold`，本轮不调整。
 9. 超过阈值后，`Policy` 根据全局 expert load 计算新的全局 slot 分布。
 10. `LBVCAdaptor` 将目标 slot 分布对齐到当前物理 slot，生成 `ExpertUpdateTask`。
 11. `ExpertUpdator` 接收任务并通过 HCCL 完成迁入专家互传。
@@ -342,9 +359,42 @@ Balance 模式不再局限于 pair 内对端专家副本，而是以全局负载
 
 不同 `num_runtime_experts` 的传输语义：
 
-* `< 0`：每张卡前面的 resident 热专家参与全局均衡并走 HCCL，末尾 cold buffer 专家保持固定并从 CPU 加载。
+* `< 0`：每张卡前面的 resident 热专家参与全局均衡并走 HCCL，末尾 cold buffer 专家保持固定并从 CPU 加载；resident 数为 0 时不执行 HCCL 热专家迁移。
 * `= 0`：原生数量的 slots 参与全局均衡，迁入专家走 HCCL，计算继续使用原生 fused experts 路径。
 * `> 0`：原生 slots 加 redundant slots 共同参与全局均衡，热点专家可拥有副本，迁入专家走 HCCL。
+
+### Offline Scheduler
+
+适用条件：
+
+* `enable_offline_scheduler = True`。
+* 当前使用 vLLM V0 `Scheduler` 的 chunked prefill 调度路径。
+
+初始化流程：
+
+1. 插件注册阶段调用 `apply_offline_scheduler_patch()`。
+2. Runtime 将 `scheduler_min_step_tokens`、`scheduler_reorder_window` 和 `scheduler_policy` 传给 scheduler patch。
+3. Patch 只替换 vLLM V0 `Scheduler._schedule_chunked_prefill`，并新增 `_schedule_prefills_offline`。
+4. 如果当前环境只有 vLLM V1 scheduler，Runtime 只写入 marker 和调度配置字段，不改写 V1 调度行为。
+
+调度流程：
+
+1. 每个 scheduler step 先按 vLLM 原逻辑调度 running 请求。
+2. 如果没有 preempt 或 swap out，再调度 swapped 请求。
+3. 调度 waiting prefill 前，根据 `scheduler_policy` 对 waiting 队列前 `scheduler_reorder_window` 个请求做稳定重排。
+4. `fifo` 不改变 waiting 队列顺序。
+5. `throughput` 使用 prompt token 数作为排序依据，较长请求优先进入本 step。
+6. `expert` 优先使用请求 metadata 中的专家代价 hint，代价低的请求优先；没有 hint 的请求按 `throughput` 规则排序。
+7. 调度器持续从 waiting 队列选择可分配请求，直到 token budget、seq budget 或 block allocation 限制触发。
+8. 如果当前 step 的 decode token 与 prefill token 总数小于 `scheduler_min_step_tokens`，且仍有 token budget，则继续尝试追加 waiting prefill。
+9. 无法调度但未被忽略的请求按原相对顺序放回 waiting 队列。
+10. 输出 `SchedulerOutputs` 后，若 vLLM statistics collector 可用，则记录本 step 调度统计。
+
+该调度策略与专家卸载、负载均衡的关系：
+
+* 对 offload 模式，`throughput` 和 `expert` 都倾向于提高单 step token 数，减少小 batch 下 cold buffer 加载成本占比。
+* 对 balance 模式，`expert` 可使用上游离线画像或历史专家代价 hint，把预计会放大热点 rank 负载的请求延后，但不直接触发专家迁移。
+* scheduler 不读取 Runtime expert map，不执行 CPU-NPU 传输，也不生成 HCCL 更新任务；专家布局仍由 `RuntimeCore`、`ExoExecutor` 和 `LBVCAdaptor` 管理。
 
 ## 8. 历史映射初始化
 

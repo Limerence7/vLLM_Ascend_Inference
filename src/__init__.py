@@ -5,9 +5,8 @@ from .runtime_config import RuntimeConfig, set_runtime_config
 
 
 def register_plugin(config: RuntimeConfig | None = None):
-    runtime_config = None
-    runtime_config = set_runtime_config(config)
-    
+    runtime_config = set_runtime_config(config or RuntimeConfig())
+
     if runtime_config.enable_offline_scheduler:
         from .offline_scheduler import apply_offline_scheduler_patch
         print("Applying offline scheduler patch...")

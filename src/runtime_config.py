@@ -14,10 +14,11 @@ class RuntimeConfig:
 
     load_history_path: str | None = None
     enable_history_mapping: bool = False
-    load_collect_interval: int = 1
-    rebalance_interval: int | None = None
-    policy_interval: int = 16
-    imbalance_threshold: float = 1.2
+    enable_load_collection: bool = False
+    load_collect_interval: int = 128
+    rebalance_interval: int = 512
+    policy_interval: int = 512
+    imbalance_threshold: float = 1.5
 
     num_buffers: int = 2
 
@@ -26,7 +27,7 @@ class RuntimeConfig:
     scheduler_min_step_tokens: int | None = None
     scheduler_reorder_window: int = 64
     scheduler_policy: str = "expert"
-    rebalance_min_step_tokens: int | None = None
+    rebalance_min_step_tokens: int = 4096
 
     def validate(self) -> None:
         self.runtime_mode = self.runtime_mode.strip().lower()
@@ -89,6 +90,17 @@ class RuntimeConfig:
         return (
             self.runtime_mode in ("offload", "balance")
             and self.num_runtime_experts < 0)
+
+    @property
+    def needs_load_collection(self) -> bool:
+        return (
+            self.runtime_mode == "profile"
+            or self.enable_load_collection
+            or self.runtime_mode == "balance")
+
+    @property
+    def needs_dynamic_rebalance(self) -> bool:
+        return self.runtime_mode == "balance"
 
     def prepare_for_model(self, num_layers: int, num_experts: int) -> None:
         self.validate()

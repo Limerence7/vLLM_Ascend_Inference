@@ -25,27 +25,42 @@ class ExpertUpdator:
     def transfer(self, layer, task: ExpertUpdateTask) -> None:
         ops: list[dist.P2POp] = []
         send_tensors: list[torch.Tensor] = []
+        local_bundles: list[tuple[int, dict[str, torch.Tensor]]] = []
         recv_bundles: list[tuple[int, dict[str, torch.Tensor]]] = []
         for copy_task in task.copies:
+            if (copy_task.source_rank == layer.ep_rank
+                    and copy_task.target_rank == layer.ep_rank):
+                local_bundles.append((
+                    copy_task.target_slot,
+                    {
+                        name: tensor.clone()
+                        for name, tensor in self._expert_slot(
+                            layer, copy_task.source_slot).items()
+                    },
+                ))
+                continue
             if copy_task.target_rank == layer.ep_rank:
                 bundle = self._empty_expert_slot_like(layer)
                 recv_bundles.append((copy_task.target_slot, bundle))
+                source_rank = self._global_rank(layer, copy_task.source_rank)
                 ops.extend(
-                    dist.P2POp(dist.irecv, tensor, copy_task.source_rank)
+                    dist.P2POp(dist.irecv, tensor, source_rank)
                     for tensor in bundle.values())
             if copy_task.source_rank == layer.ep_rank:
+                target_rank = self._global_rank(layer, copy_task.target_rank)
                 for tensor in self._expert_slot(
                         layer, copy_task.source_slot).values():
                     tensor = tensor.clone()
                     send_tensors.append(tensor)
                     ops.append(
-                        dist.P2POp(dist.isend, tensor,
-                                   copy_task.target_rank))
+                        dist.P2POp(dist.isend, tensor, target_rank))
 
         if ops:
             for request in dist.batch_isend_irecv(ops):
                 request.wait()
         with torch.no_grad():
+            for target_slot, tensors in local_bundles:
+                self._write_expert_slot(layer, target_slot, tensors)
             for target_slot, tensors in recv_bundles:
                 self._write_expert_slot(layer, target_slot, tensors)
 
@@ -93,3 +108,12 @@ class ExpertUpdator:
                     fp32_tensor[target_slot].copy_(source)
             else:
                 getattr(layer, name)[target_slot].copy_(source)
+
+    @staticmethod
+    def _global_rank(layer, ep_rank: int) -> int:
+        if not dist.is_available() or not dist.is_initialized():
+            return int(ep_rank)
+        group = getattr(layer.moe_config.ep_group, "device_group", None)
+        if group is None:
+            return int(ep_rank)
+        return dist.get_process_group_ranks(group)[int(ep_rank)]

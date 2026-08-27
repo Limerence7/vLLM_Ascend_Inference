@@ -13,8 +13,8 @@ Inference_Config = {
         "model_path": "/workspace/models/Qwen3-30B-A3B",
         "batch_size": 1024,
         "max_length": 2048,
-        "max_new_tokens": 512,
-        "world_size": 2,
+        "max_new_tokens": 128,
+        "world_size": 4,
         "utilization": 0.85,
     },
     "Qwen3-235B-A22B": {
@@ -28,14 +28,14 @@ Inference_Config = {
     "Qwen3-235B-A22B-W8A8": {
         "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
         "batch_size": 512,
-        "max_length": 32,
-        "max_new_tokens": 5120,
-        "world_size": 8,
-        "utilization": 0.80,
+        "max_length": 1024,
+        "max_new_tokens": 128,
+        "world_size": 4,
+        "utilization": 0.98,
     },
 }
 
-current_config = Inference_Config["Qwen3-235B-A22B"]
+current_config = Inference_Config["Qwen3-235B-A22B-W8A8"]
 
 def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):
     text = ""
@@ -85,8 +85,8 @@ if __name__ == "__main__":
         trust_remote_code=True,
         gpu_memory_utilization=current_config["utilization"],
         max_model_len=current_config["max_length"] + current_config["max_new_tokens"],
-        dtype="bfloat16",
-        # quantization='ascend',
+        # dtype="bfloat16",
+        quantization='ascend',
         enforce_eager=True,
     )
 

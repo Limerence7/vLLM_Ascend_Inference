@@ -12,7 +12,7 @@ class ExoExecutor(nn.Module):
         self,
         config: RuntimeConfig,
         uses_w8a8: bool,
-        memory_manager: ExpertMemoryManager,
+        memory_manager: ExpertMemoryManager | None,
     ):
         super().__init__()
         self.config = config
@@ -21,6 +21,7 @@ class ExoExecutor(nn.Module):
         self.layers: dict[int, nn.Module] = {}
         self.expert_maps: dict[int, list[int]] = {}
         self.full_expert_maps: dict[int, torch.Tensor] = {}
+        self.slot_to_global_maps: dict[int, torch.Tensor] = {}
         self.cold_experts = nn.ModuleList()
         self.buffer_idx = 0
         self.buffer_status: list[int | None] = []
@@ -28,11 +29,6 @@ class ExoExecutor(nn.Module):
 
     def should_manage_layer(self, layer) -> bool:
         return layer.moe_instance_id in self.config.runtime_layer_ids
-
-    @property
-    def collect_load(self) -> bool:
-        return (self.config.runtime_mode == "balance"
-                or bool(self.config.load_history_path))
 
     def should_store_cpu_expert(self, layer, global_expert_id: int) -> bool:
         if not self.should_manage_layer(layer) or global_expert_id < 0:
@@ -55,6 +51,7 @@ class ExoExecutor(nn.Module):
         self.layers[layer_id] = layer
         self.expert_maps[layer_id] = list(expert_map)
         if self.config.uses_cold_buffer:
+            assert self.memory_manager is not None
             self.memory_manager.register_layer(
                 layer_id, layer,
                 self._cold_experts(layer_id))
@@ -65,6 +62,7 @@ class ExoExecutor(nn.Module):
         if not self.should_store_cpu_expert(layer, global_expert_id):
             return False
 
+        assert self.memory_manager is not None
         return self.memory_manager.load_weight_shard(
             layer_id=layer.moe_instance_id,
             param_name=param_name,
@@ -75,6 +73,9 @@ class ExoExecutor(nn.Module):
         )
 
     def process_layer_after_loading(self, layer, quant_method) -> None:
+        if self.memory_manager is None:
+            return
+
         layer_id = layer.moe_instance_id
         if layer_id not in self.memory_manager.layers:
             return
@@ -93,7 +94,7 @@ class ExoExecutor(nn.Module):
         return PreparedCombinedExperts(
             CombinedExperts(layer, cold_expert, len(expert_ids)),
             self._full_expert_map(layer, device),
-            torch.tensor(expert_ids, dtype=torch.long),
+            self._slot_to_global(layer),
         )
 
     def prefetch_next_layers(self, layer) -> None:
@@ -115,6 +116,7 @@ class ExoExecutor(nn.Module):
         cold_experts = self._cold_experts(layer_id)
         self.expert_maps[layer_id] = [*expert_ids, *cold_experts]
         self.full_expert_maps.pop(layer_id, None)
+        self.slot_to_global_maps.pop(layer_id, None)
 
     def _hot_count(self, num_slots: int) -> int:
         return (max(0, num_slots - self.config.offload_count)
@@ -141,6 +143,15 @@ class ExoExecutor(nn.Module):
                 f"Layer {layer_id} is bound to {expert_map.device}, "
                 f"but received {device}.")
         return expert_map
+
+    def _slot_to_global(self, layer) -> torch.Tensor:
+        layer_id = layer.moe_instance_id
+        slot_to_global = self.slot_to_global_maps.get(layer_id)
+        if slot_to_global is None:
+            slot_to_global = torch.tensor(
+                self.expert_maps[layer_id], dtype=torch.long)
+            self.slot_to_global_maps[layer_id] = slot_to_global
+        return slot_to_global
 
     @staticmethod
     def _build_routing_map(layer, expert_ids: list[int],

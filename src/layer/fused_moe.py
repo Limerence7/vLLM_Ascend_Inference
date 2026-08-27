@@ -332,7 +332,10 @@ class RuntimeAscendFusedMoE(FusedMoE):
                 ep_rank=self.ep_rank,
                 global_load=global_load,
             ))
-        self.log2phy = self.log2phy.npu()
+        if self.runtime_core.config.redundant_count > 0:
+            self.log2phy = self.log2phy.npu()
+        else:
+            self.log2phy = None
         return slot_to_global
 
     def _init_native_eplb_map(self, num_experts: int) -> bool:
@@ -380,7 +383,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
                 f"{self.moe_instance_id} with {len(expert_map)} slots.")
         self.local_num_experts = hot_count
         self._expert_map = self._build_expert_lookup(
-            expert_map[:hot_count])
+            expert_map[:hot_count]).npu()
         return expert_map, initial_lookup, full_count
 
     def _log_expert_layout(self,
@@ -405,7 +408,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
 
     def _init_moe_load(self) -> None:
         self.moe_load = (
-            torch.zeros(self.local_num_experts, dtype=torch.int64)
+            torch.zeros(self.local_num_experts, dtype=torch.int64).npu()
             if self.dynamic_eplb else None)
 
     def _setup_moe_comm_method(self) -> None:
@@ -449,6 +452,13 @@ class RuntimeAscendFusedMoE(FusedMoE):
         return QuantType.NONE
 
     def get_log2phy_map(self):
+        return self.log2phy
+
+    def _effective_log2phy(self):
+        if (self.runtime_core.config.runtime_mode == "balance"
+                and self.runtime_core.should_manage_layer(self)
+                and self.runtime_core.config.redundant_count == 0):
+            return None
         return self.log2phy
 
     def clear_moe_load(self):
@@ -538,7 +548,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
             dynamic_scale_for_share=None,
             shared_experts=None,
             enable_force_load_balance=enable_force_load_balance,
-            log2phy=self.log2phy,
+            log2phy=self._effective_log2phy(),
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask)
 
