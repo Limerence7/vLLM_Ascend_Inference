@@ -26,7 +26,7 @@ RUNTIME_CONFIG = RuntimeConfig(
     cpu_pin_memory=True,
     runtime_layer_ids=[],
     load_history_path=None,
-    enable_offline_scheduler=False,
+    enable_scheduler=False,
     enable_history_mapping=False,
 )
 

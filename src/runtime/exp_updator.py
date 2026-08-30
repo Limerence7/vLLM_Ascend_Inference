@@ -126,8 +126,8 @@ class ExpertUpdator:
     @staticmethod
     def _global_rank(layer, ep_rank: int) -> int:
         if not dist.is_available() or not dist.is_initialized():
-            return int(ep_rank)
+            return ep_rank
         group = getattr(layer.moe_config.ep_group, "device_group", None)
         if group is None:
-            return int(ep_rank)
-        return dist.get_process_group_ranks(group)[int(ep_rank)]
+            return ep_rank
+        return dist.get_process_group_ranks(group)[ep_rank]

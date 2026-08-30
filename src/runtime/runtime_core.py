@@ -3,6 +3,8 @@ import torch
 from ..moeload.policy import ExpertPolicy
 from ..moeload.profiler import ExpertLoadProfiler
 from ..runtime_config import RuntimeConfig
+from ..scheduler.core import (configure_worker_activation,
+                              record_worker_expert_activation)
 from .exo_executor import ExoExecutor
 from .lbvc_adaptor import LBVCAdaptor
 from .memory_manager import ExpertMemoryManager
@@ -194,6 +196,20 @@ class RuntimeCore:
         else:
             self.profiler.record_expert_tokens(
                 int(layer.moe_instance_id), expert_tokens, group_list_type)
+
+    def record_request_experts(
+        self,
+        layer,
+        topk_ids: torch.Tensor,
+    ) -> None:
+        if not self.config.enable_scheduler:
+            return
+        configure_worker_activation(self.config)
+        record_worker_expert_activation(
+            int(layer.moe_instance_id),
+            topk_ids,
+            int(layer.global_num_experts),
+        )
 
     def record_slot_expert_tokens(
         self,

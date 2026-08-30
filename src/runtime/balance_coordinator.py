@@ -15,7 +15,7 @@ class LayerBalanceCandidate:
 
     @property
     def layer_id(self) -> int:
-        return int(self.layer.moe_instance_id)
+        return self.layer.moe_instance_id
 
     @property
     def improvement(self) -> float:
@@ -26,8 +26,8 @@ class BalanceCoordinator:
     """Select a bounded set of profitable layers per rebalance cycle."""
 
     def __init__(self, max_layers: int, min_improvement: float):
-        self.max_layers = int(max_layers)
-        self.min_improvement = float(min_improvement)
+        self.max_layers = max_layers
+        self.min_improvement = min_improvement
         self._pending: dict[int, LayerBalanceCandidate] = {}
 
     def submit(self, candidate: LayerBalanceCandidate | None) -> None:

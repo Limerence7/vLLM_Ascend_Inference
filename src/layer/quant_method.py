@@ -139,6 +139,7 @@ class RuntimeFusedMoEMethod:
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts)
         topk_weights = topk_weights.to(x.dtype)
+        layer.runtime_core.record_request_experts(layer, topk_ids)
 
         if enable_force_load_balance:
             random_matrix = torch.rand(topk_ids.size(0),

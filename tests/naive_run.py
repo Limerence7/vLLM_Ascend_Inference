@@ -35,7 +35,7 @@ Inference_Config = {
     },
 }
 
-current_config = Inference_Config["Qwen3-235B-A22B-W8A8"]
+current_config = Inference_Config["Qwen3-30B-A3B"]
 
 def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):
     text = ""
@@ -86,8 +86,8 @@ if __name__ == "__main__":
         trust_remote_code=True,
         gpu_memory_utilization=current_config["utilization"],
         max_model_len=current_config["max_length"] + current_config["max_new_tokens"],
-        # dtype="bfloat16",
-        quantization='ascend',
+        dtype="bfloat16",
+        # quantization='ascend',
         enforce_eager=True,
     )
 

@@ -15,20 +15,23 @@ class RuntimeConfig:
     load_history_path: str | None = None
     enable_history_mapping: bool = False
     enable_load_collection: bool = False
-    load_collect_interval: int = 128
-    rebalance_interval: int = 512
-    policy_interval: int = 512
+    load_collect_interval: int = 64
+    rebalance_interval: int = 256
+    policy_interval: int = 256
     imbalance_threshold: float = 1.5
-    rebalance_max_layers: int = 1
+    rebalance_max_layers: int = 0
     rebalance_min_improvement: float = 0.01
 
     num_buffers: int = 2
 
-    enable_offline_scheduler: bool = False
-    min_step_tokens: int = 4000
-    scheduler_min_step_tokens: int | None = None
-    scheduler_reorder_window: int = 64
-    scheduler_policy: str = "expert"
+    enable_scheduler: bool = False
+    scheduler_reorder_window: int | None = None
+    scheduler_policy: str = "auto"
+    scheduler_decode_reserve_ratio: float | None = None
+    scheduler_activation_similarity_threshold: float | None = None
+    scheduler_max_profile_experts: int | None = None
+    scheduler_feedback_interval: int | None = None
+    scheduler_feedback_max_layers: int | None = None
     rebalance_min_step_tokens: int = 4096
 
     def validate(self) -> None:
@@ -54,18 +57,29 @@ class RuntimeConfig:
             'rebalance_max_layers must be non-negative; 0 means unlimited.')
         assert self.rebalance_min_improvement >= 0, (
             'rebalance_min_improvement must be non-negative.')
-        assert self.min_step_tokens >= 0, (
-            'min_step_tokens must be a non-negative integer.')
-        assert self.scheduler_policy in ("fifo", "throughput", "expert"), (
-            'scheduler_policy must be one of fifo, throughput or expert.')
-        assert self.scheduler_reorder_window > 0, (
-            'scheduler_reorder_window must be a positive integer.')
-        if self.scheduler_min_step_tokens is None:
-            self.scheduler_min_step_tokens = self.min_step_tokens
-        if self.rebalance_min_step_tokens is None:
-            self.rebalance_min_step_tokens = self.min_step_tokens
-        assert self.scheduler_min_step_tokens >= 0, (
-            'scheduler_min_step_tokens must be a non-negative integer.')
+        assert self.scheduler_policy in (
+            "auto", "fifo", "throughput", "expert", "offload"
+        ), ('scheduler_policy must be one of auto, fifo, throughput, expert '
+            'or offload.')
+        if self.scheduler_reorder_window is not None:
+            assert self.scheduler_reorder_window > 0, (
+                'scheduler_reorder_window must be a positive integer.')
+        if self.scheduler_decode_reserve_ratio is not None:
+            assert 0.0 <= self.scheduler_decode_reserve_ratio <= 1.0, (
+                'scheduler_decode_reserve_ratio must be between 0 and 1.')
+        if self.scheduler_activation_similarity_threshold is not None:
+            assert 0.0 <= self.scheduler_activation_similarity_threshold <= 1.0, (
+                'scheduler_activation_similarity_threshold must be between '
+                '0 and 1.')
+        if self.scheduler_max_profile_experts is not None:
+            assert self.scheduler_max_profile_experts > 0, (
+                'scheduler_max_profile_experts must be positive.')
+        if self.scheduler_feedback_interval is not None:
+            assert self.scheduler_feedback_interval > 0, (
+                'scheduler_feedback_interval must be positive.')
+        if self.scheduler_feedback_max_layers is not None:
+            assert self.scheduler_feedback_max_layers > 0, (
+                'scheduler_feedback_max_layers must be positive.')
         assert self.rebalance_min_step_tokens >= 0, (
             'rebalance_min_step_tokens must be a non-negative integer.')
         if self.runtime_mode == "profile":

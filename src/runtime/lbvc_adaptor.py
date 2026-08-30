@@ -87,14 +87,12 @@ class LBVCAdaptor:
 
     def record_expert_tokens(self, layer, group_list_type: int,
                              expert_tokens: torch.Tensor, step: int) -> None:
-        if step <= 0:
-            return
         self.profiler.record_expert_tokens(
             layer.moe_instance_id,
             expert_tokens,
             group_list_type,
         )
-        if step % int(self.config.rebalance_interval) == 0:
+        if step % self.config.rebalance_interval == 0:
             self._queue_global_expert_update(layer)
 
     def record_slot_expert_tokens(
@@ -117,12 +115,12 @@ class LBVCAdaptor:
             self._queue_global_expert_update(layer)
 
     def _queue_global_expert_update(self, layer) -> None:
-        layer_id = int(layer.moe_instance_id)
+        layer_id = layer.moe_instance_id
         counts = self.profiler.get_layer_delta_load(layer_id)
-        if counts.numel() >= int(layer.logical_num_experts):
+        if counts.numel() >= layer.logical_num_experts:
             self._pending_layer_loads[layer_id] = (
                 layer,
-                counts[:int(layer.logical_num_experts)],
+                counts[:layer.logical_num_experts],
             )
         if self._is_rebalance_cycle_boundary(layer):
             self._plan_and_flush_updates()

@@ -34,6 +34,10 @@ vLLM_Ascend_Inference/
 │   ├── model.py
 │   ├── runtime_config.py
 │   ├── utils.py
+│   ├── scheduler/
+│   │   ├── __init__.py
+│   │   ├── core.py
+│   │   └── patch.py
 │   ├── layer/
 │   │   ├── fused_moe.py
 │   │   ├── moe_mlp.py
@@ -61,6 +65,7 @@ vLLM_Ascend_Inference/
     ├── naive_run.py
     ├── runtime_dp_test.py
     ├── runtime_run.py
+    ├── test_scheduler.py
     ├── test_balance_policy.py
     └── template.py
 ```
@@ -70,6 +75,7 @@ vLLM_Ascend_Inference/
 * `src/__init__.py`：插件注册入口，接收 Runtime 配置并注册自定义 Qwen3 MoE 模型。
 * `src/model.py`：模型接管入口，按配置选择需要替换的 MoE 层；`profile` 模式下保持原生专家计算路径并接入 profiler。
 * `src/runtime_config.py`：统一配置定义和校验，覆盖模式选择、接管层、CPU memory、profiler、policy 和 `num_runtime_experts` 参数。
+* `src/scheduler/`：vLLM V1 请求调度子系统；`core.py` 集中实现自动参数推导、请求级 MoE 激活画像和 prefill/decode 策略，`patch.py` 负责接入 V1 Scheduler，`__init__.py` 提供公开接口。
 * `src/layer/fused_moe.py`：Runtime FusedMoE 层入口，负责专家 slot 创建、权重拦截、forward 接管和 profiler 写入。
 * `src/layer/quant_method.py`：Runtime MoE 计算适配层，接入 vLLM-Ascend token dispatcher，并在 cold-buffer 场景下调用统一专家 MLP。
 * `src/layer/moe_mlp.py`：从 vLLM-Ascend MLP 逻辑中抽取出的本地 MoE MLP，支持非量化和 W8A8 expert weight list。
@@ -120,11 +126,14 @@ Profiler 与策略参数：
 * `imbalance_threshold`：触发专家重映射或冗余加载的 rank 负载 peak/average ratio（PAR）阈值。
 * `rebalance_max_layers`：每个 rebalance 周期最多实际更新的层数；`0` 表示不限制，默认 `1`。
 * `rebalance_min_improvement`：候选布局相对当前布局至少需要降低的 peak/average 负载比，避免低收益迁移。
-* `enable_offline_scheduler`：是否启用离线调度 patch。
-* `min_step_tokens`：兼容参数，作为 `scheduler_min_step_tokens` 和 `rebalance_min_step_tokens` 的默认值。
-* `scheduler_min_step_tokens`：离线请求调度每个 scheduler step 尽量达到的 token 数软下限。
-* `scheduler_reorder_window`：离线调度只在 waiting 队列前若干请求内做局部稳定重排，避免全局重排破坏公平性。
-* `scheduler_policy`：离线调度策略，可选 `fifo`、`throughput` 或 `expert`。
+* `enable_scheduler`：是否启用请求调度 patch。
+* `scheduler_reorder_window`：请求调度只在队列前若干请求内做局部稳定重排；留空时自动根据最大并发序列数和是否使用 cold buffer 推导。
+* `scheduler_policy`：请求调度策略，可选 `auto`、`fifo`、`throughput`、`expert` 或 `offload`；默认 `auto`。
+* `scheduler_decode_reserve_ratio`：running 队列中 decode 请求簇的前置保留比例，避免 decode 延迟和长 prefill 饥饿互相失控；留空时自动推导。
+* `scheduler_activation_similarity_threshold`：请求 MoE 激活画像聚类阈值；留空时根据是否卸载自动推导。
+* `scheduler_max_profile_experts`：每个请求激活画像保留的热点专家上限；留空时根据卸载专家数自动推导。
+* `scheduler_feedback_interval`：实际 MoE 激活画像的周期采样间隔；请求首次进入模型时始终采样，后续间隔留空时根据卸载专家数自动推导。
+* `scheduler_feedback_max_layers`：单次请求画像最多采样的 Runtime MoE 层数；留空时均匀选择最多 4 层。
 * `rebalance_min_step_tokens`：balance 调整前的最小统计 token 数，窗口内 token 太少时跳过重排。
 
 Balance 参数：
@@ -137,8 +146,10 @@ Balance 专家权重只通过 HCCL 在 rank 间互传；CPU-NPU 仅用于固定 
 * `fifo`：保持 vLLM waiting 队列原始顺序，只保留原有 chunked prefill 填充逻辑。
 * `throughput`：在 `scheduler_reorder_window` 内优先调度 prompt token 数较多的请求，用于离线大 batch 场景下放大单 step token 数，摊薄 offload cold buffer 加载成本。
 * `expert`：优先读取请求上的轻量专家代价 hint，如 `vllm_ascend_expert_cost`、`expert_cost`、`scheduler_cost` 或 `priority`，代价低的请求先调度；没有 hint 时回退到 `throughput`。
+* `offload`：把 CPU-NPU 权重传输视为每层固定成本，扩大局部候选窗口，并在 prefill/decode 各阶段内按 MoE 激活相似度形成较大的请求 cohort。
+* `auto`：存在 cold buffer 时选择 `offload`，否则选择 `expert`；所有未显式配置的调度参数由运行布局和 vLLM capacity 自动计算。
 
-请求调度只依赖 vLLM `seq_group` 的请求属性和可选 metadata hint，不直接引用 `RuntimeCore`、`MemoryManager`、`ExoExecutor` 或 `LBVCAdaptor`，避免调度逻辑与专家卸载、专家迁移实现耦合。
+请求调度通过 `RuntimeConfig` 消费 offload count、buffer 数和接管层数，不直接持有 `RuntimeCore`、`MemoryManager`、`ExoExecutor` 或 `LBVCAdaptor`。请求级激活画像可从 `sampling_params.extra_args`/metadata 读取，也可通过 `record_request_activation()` 在线发布，从而为后续 profiler 请求追踪保留稳定接口。
 
 ## 5. 核心抽象
 
@@ -385,37 +396,48 @@ Balance 模式不再局限于 pair 内对端专家副本，而是以全局负载
 * `= 0`：原生数量的 slots 参与全局均衡，迁入专家走 HCCL，计算继续使用原生 fused experts 路径。
 * `> 0`：原生 slots 加 redundant slots 共同参与全局均衡，热点专家可拥有副本，迁入专家走 HCCL。
 
-### Offline Scheduler
+### Request Scheduler
 
 适用条件：
 
-* `enable_offline_scheduler = True`。
-* 当前使用 vLLM V0 `Scheduler` 的 chunked prefill 调度路径。
+* `enable_scheduler = True`。
+* 当前使用 vLLM V1 Scheduler。
 
 初始化流程：
 
-1. 插件注册阶段调用 `apply_offline_scheduler_patch()`。
-2. Runtime 将 `scheduler_min_step_tokens`、`scheduler_reorder_window` 和 `scheduler_policy` 传给 scheduler patch。
-3. Patch 只替换 vLLM V0 `Scheduler._schedule_chunked_prefill`，并新增 `_schedule_prefills_offline`。
-4. 如果当前环境只有 vLLM V1 scheduler，Runtime 只写入 marker 和调度配置字段，不改写 V1 调度行为。
+1. 插件注册阶段调用 `apply_scheduler_patch()`。
+2. Runtime 把完整 `RuntimeConfig` 传给 scheduler patch，调度器在 vLLM Scheduler 实例建立后结合其 token/sequence capacity 解析最终参数。
+3. Patch 在原生 `Scheduler.schedule()` 前局部重排 running 和 FCFS waiting 队列，再把 token budget、KV cache 分配、抢占和输出构造完整委托给 vLLM；priority queue 保持原生优先级语义。
 
 调度流程：
 
-1. 每个 scheduler step 先按 vLLM 原逻辑调度 running 请求。
-2. 如果没有 preempt 或 swap out，再调度 swapped 请求。
-3. 调度 waiting prefill 前，根据 `scheduler_policy` 对 waiting 队列前 `scheduler_reorder_window` 个请求做稳定重排。
-4. `fifo` 不改变 waiting 队列顺序。
-5. `throughput` 使用 prompt token 数作为排序依据，较长请求优先进入本 step。
-6. `expert` 优先使用请求 metadata 中的专家代价 hint，代价低的请求优先；没有 hint 的请求按 `throughput` 规则排序。
-7. 调度器持续从 waiting 队列选择可分配请求，直到 token budget、seq budget 或 block allocation 限制触发。
-8. 如果当前 step 的 decode token 与 prefill token 总数小于 `scheduler_min_step_tokens`，且仍有 token budget，则继续尝试追加 waiting prefill。
-9. 无法调度但未被忽略的请求按原相对顺序放回 waiting 队列。
-10. 输出 `SchedulerOutputs` 后，若 vLLM statistics collector 可用，则记录本 step 调度统计。
+1. 自动模式根据 `max_num_seqs`、cold expert 数量、Runtime 层数和 buffer 数推导 reorder window、decode reserve、画像阈值和画像宽度。
+2. 调度器识别 running 请求当前处于 chunked prefill 还是 decode；先安排达到 `scheduler_decode_reserve_ratio` 的完整 decode 激活簇，再安排 prefill 簇，最后安排剩余 decode 簇。
+3. waiting 队列和各阶段 running 请求都在局部窗口内按 MoE 激活画像余弦相似度聚类；同簇请求保持相邻，簇内 prefill 优先长请求，decode 保持到达顺序。
+4. 请求画像优先读取实际推理产生的在线画像 registry；首次运行前可读取 `vllm_ascend_moe_activation`、`moe_activation`、`expert_activation`、`expert_histogram` 或 expert id 列表作为先验，再回退到 expert cost/throughput。
+5. Patch 保留原生 token budget、KV cache allocation、preemption、structured output 和 speculative decode 逻辑，只改变进入原生算法前的有限窗口顺序。
+6. 无法调度的请求仍按原 Scheduler 规则保留或放回队列。
+
+在线激活反馈流程：
+
+1. `NPUModelRunner._prepare_inputs()` 完成后，Runtime 读取本 step 的 `req_ids` 和每请求 token 数，建立扁平 token 到 request 的区间映射。
+2. Runtime MoE 完成 `select_experts()` 后，把逻辑 `topk_ids` 交给 worker 画像收集器。
+3. 收集器在设备侧使用 `index_add_` 聚合 request/layer/expert 计数；ACLGraph 末尾 padding 不计入画像，无法可靠匹配请求区间的短 token 布局直接跳过。
+4. 每个请求首次执行时采样；后续按 `scheduler_feedback_interval` 周期采样，并从均匀选取的有限层中只保留 top experts。
+5. `NPUModelRunner.sample_tokens()` 把纯 Python 字典 payload 附加到 `ModelRunnerOutput`，复用 vLLM 现有 pickle IPC 返回 Scheduler，不新增 RPC。
+6. `Scheduler.update_from_output()` 在下一调度步前合并请求画像；请求结束或 abort 后同时清理 scheduler registry 和 worker seen state。
+
+当前反馈边界：
+
+* eager 模式可逐 step 获得真实 `topk_ids`；ACLGraph replay 不执行 Python 路由采集时不会生成错误画像，但只能等待后续 graph-aware hook。
+* sequence parallel 导致本 rank token 数小于请求区间总数时跳过该批，避免把局部 token 归属到错误请求。
+* 第一版以非 PP 或 Runtime MoE 位于输出 PP stage 为目标；跨 PP stage 的画像归并需要后续 collective/side channel。
+* 当前 patch 面向 vLLM-Ascend V1 `NPUModelRunner`，V2 model runner 尚未接入反馈 hook。
 
 该调度策略与专家卸载、负载均衡的关系：
 
-* 对 offload 模式，`throughput` 和 `expert` 都倾向于提高单 step token 数，减少小 batch 下 cold buffer 加载成本占比。
-* 对 balance 模式，`expert` 可使用上游离线画像或历史专家代价 hint，把预计会放大热点 rank 负载的请求延后，但不直接触发专家迁移。
+* 对 offload 模式，自动重排窗口随 fixed cold-buffer transfer pressure 增长，使 MoE 激活相似请求形成更大的连续 cohort，并依靠 V1 原生 token budget 填充摊薄 CPU-NPU 加载成本。
+* 对 balance 模式，激活画像或专家代价 hint 可把相似请求组成稳定批次，为后续结合当前 expert map 评估 rank 热点成本预留接口，但不直接触发专家迁移。
 * scheduler 不读取 Runtime expert map，不执行 CPU-NPU 传输，也不生成 HCCL 更新任务；专家布局仍由 `RuntimeCore`、`ExoExecutor` 和 `LBVCAdaptor` 管理。
 
 ## 8. 历史映射初始化

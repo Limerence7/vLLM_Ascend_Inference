@@ -51,7 +51,7 @@ TEST_CONFIG = {
 
 RUNTIME_CONFIG = RuntimeConfig(
     runtime_mode="balance",
-    interval=12,
+    interval=4,
     num_buffers=2,
     num_runtime_experts=0,
     cpu_pin_memory=True,
@@ -59,10 +59,9 @@ RUNTIME_CONFIG = RuntimeConfig(
     # load_history_path=str(LOAD_HISTORY_PATH),
     load_history_path=None,
     enable_load_collection=True,
-    enable_offline_scheduler=False,
+    enable_scheduler=False,
     enable_history_mapping=False,
     scheduler_policy="expert",
-    scheduler_min_step_tokens=8192,
     scheduler_reorder_window=64,
     rebalance_min_step_tokens=16384,
 )
