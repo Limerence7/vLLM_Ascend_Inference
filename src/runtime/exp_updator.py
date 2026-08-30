@@ -23,45 +23,59 @@ class ExpertUpdator:
     """Execute prepared expert weight update tasks with HCCL."""
 
     def transfer(self, layer, task: ExpertUpdateTask) -> None:
+        self.transfer_many([(layer, task)])
+
+    def transfer_many(
+        self,
+        layer_tasks: list[tuple[object, ExpertUpdateTask]],
+    ) -> None:
+        """Launch all selected layers in one batched P2P operation."""
         ops: list[dist.P2POp] = []
         send_tensors: list[torch.Tensor] = []
-        local_bundles: list[tuple[int, dict[str, torch.Tensor]]] = []
-        recv_bundles: list[tuple[int, dict[str, torch.Tensor]]] = []
-        for copy_task in task.copies:
-            if (copy_task.source_rank == layer.ep_rank
-                    and copy_task.target_rank == layer.ep_rank):
-                local_bundles.append((
-                    copy_task.target_slot,
-                    {
-                        name: tensor.clone()
-                        for name, tensor in self._expert_slot(
-                            layer, copy_task.source_slot).items()
-                    },
-                ))
-                continue
-            if copy_task.target_rank == layer.ep_rank:
-                bundle = self._empty_expert_slot_like(layer)
-                recv_bundles.append((copy_task.target_slot, bundle))
-                source_rank = self._global_rank(layer, copy_task.source_rank)
-                ops.extend(
-                    dist.P2POp(dist.irecv, tensor, source_rank)
-                    for tensor in bundle.values())
-            if copy_task.source_rank == layer.ep_rank:
-                target_rank = self._global_rank(layer, copy_task.target_rank)
-                for tensor in self._expert_slot(
-                        layer, copy_task.source_slot).values():
-                    tensor = tensor.clone()
-                    send_tensors.append(tensor)
-                    ops.append(
-                        dist.P2POp(dist.isend, tensor, target_rank))
+        local_bundles: list[
+            tuple[object, int, dict[str, torch.Tensor]]] = []
+        recv_bundles: list[
+            tuple[object, int, dict[str, torch.Tensor]]] = []
+        for layer, task in layer_tasks:
+            for copy_task in task.copies:
+                if (copy_task.source_rank == layer.ep_rank
+                        and copy_task.target_rank == layer.ep_rank):
+                    local_bundles.append((
+                        layer,
+                        copy_task.target_slot,
+                        {
+                            name: tensor.clone()
+                            for name, tensor in self._expert_slot(
+                                layer, copy_task.source_slot).items()
+                        },
+                    ))
+                    continue
+                if copy_task.target_rank == layer.ep_rank:
+                    bundle = self._empty_expert_slot_like(layer)
+                    recv_bundles.append(
+                        (layer, copy_task.target_slot, bundle))
+                    source_rank = self._global_rank(
+                        layer, copy_task.source_rank)
+                    ops.extend(
+                        dist.P2POp(dist.irecv, tensor, source_rank)
+                        for tensor in bundle.values())
+                if copy_task.source_rank == layer.ep_rank:
+                    target_rank = self._global_rank(
+                        layer, copy_task.target_rank)
+                    for tensor in self._expert_slot(
+                            layer, copy_task.source_slot).values():
+                        tensor = tensor.clone()
+                        send_tensors.append(tensor)
+                        ops.append(
+                            dist.P2POp(dist.isend, tensor, target_rank))
 
         if ops:
             for request in dist.batch_isend_irecv(ops):
                 request.wait()
         with torch.no_grad():
-            for target_slot, tensors in local_bundles:
+            for layer, target_slot, tensors in local_bundles:
                 self._write_expert_slot(layer, target_slot, tensors)
-            for target_slot, tensors in recv_bundles:
+            for layer, target_slot, tensors in recv_bundles:
                 self._write_expert_slot(layer, target_slot, tensors)
 
     @classmethod

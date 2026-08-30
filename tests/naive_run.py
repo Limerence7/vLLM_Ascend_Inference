@@ -65,7 +65,8 @@ def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):
                 num_seqs += 1
             if num_seqs >= batch_size:
                 break
-        
+    
+    random.shuffle(contents)
     return contents
 
 if __name__ == "__main__":

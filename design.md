@@ -45,6 +45,7 @@ vLLM_Ascend_Inference/
 │   │   ├── exo_executor.py
 │   │   ├── memory_manager.py
 │   │   ├── exp_updator.py
+│   │   ├── balance_coordinator.py
 │   │   └── lbvc_adaptor.py
 │   ├── moeload/
 │   │   ├── __init__.py
@@ -73,7 +74,7 @@ vLLM_Ascend_Inference/
 * `src/layer/quant_method.py`：Runtime MoE 计算适配层，接入 vLLM-Ascend token dispatcher，并在 cold-buffer 场景下调用统一专家 MLP。
 * `src/layer/moe_mlp.py`：从 vLLM-Ascend MLP 逻辑中抽取出的本地 MoE MLP，支持非量化和 W8A8 expert weight list。
 * `src/layer/routing.py`：只提供 `dispatch_with_local_experts`，用于在一次 grouped matmul 调用期间临时匹配 token dispatcher 的本地专家数量。
-* `src/runtime/`：运行时执行层，包含 `runtime_core`、`exo_executor`、`memory_manager`、`lbvc_adaptor` 和 `exp_updator`。
+* `src/runtime/`：运行时执行层，包含 `runtime_core`、`exo_executor`、`memory_manager`、`balance_coordinator`、`lbvc_adaptor` 和 `exp_updator`。
 * `src/moeload/`：专家负载统计和策略模块。
 * `src/roofline/`：性能建模与策略评估预留模块，不参与初版主运行路径。
 * `tests/`：插件注册、原生基准和 Runtime 模式的统一测试入口。
@@ -116,7 +117,9 @@ Profiler 与策略参数：
 * `load_collect_interval`：每隔多少次推理统计一次专家负载，balance 模式只在采样步或 rebalance 步开启统计。
 * `rebalance_interval`：每隔多少次推理尝试一次专家分布调整。
 * `policy_interval`：旧策略更新周期参数，作为 `rebalance_interval` 的兼容默认值。
-* `imbalance_threshold`：触发专家重映射或冗余加载的 rank 负载最高/最低比值阈值。
+* `imbalance_threshold`：触发专家重映射或冗余加载的 rank 负载 peak/average ratio（PAR）阈值。
+* `rebalance_max_layers`：每个 rebalance 周期最多实际更新的层数；`0` 表示不限制，默认 `1`。
+* `rebalance_min_improvement`：候选布局相对当前布局至少需要降低的 peak/average 负载比，避免低收益迁移。
 * `enable_offline_scheduler`：是否启用离线调度 patch。
 * `min_step_tokens`：兼容参数，作为 `scheduler_min_step_tokens` 和 `rebalance_min_step_tokens` 的默认值。
 * `scheduler_min_step_tokens`：离线请求调度每个 scheduler step 尽量达到的 token 数软下限。
@@ -204,11 +207,25 @@ Balance 专家权重只通过 HCCL 在 rank 间互传；CPU-NPU 仅用于固定 
 * 更新 Runtime 执行所需的映射快照。
 * 在 `enable_history_mapping = True` 时读取历史负载，调用 policy 生成初始化 expert map，并驱动 Runtime 初始化专家分布。
 * 按 `load_collect_interval` 控制负载统计频率，按 `rebalance_interval` 控制专家分布调整频率。
-* 每次调整前把 expert 负载按当前 slot 分布投影到 rank 负载；冗余副本按副本数均摊负载。
+* 每次调整前把 expert 负载按当前 slot 分布投影到 rank 负载；冗余副本按副本数均摊负载，均衡指标统一使用 peak/average ratio（PAR）。
 * 策略生成冗余副本时使用相同的副本均摊模型，按目标 rank 负载比、负载差和最大负载选择副本位置。
-* 比较当前 rank 负载最高/最低比值，超过 `imbalance_threshold` 后触发全局专家重排。
+* 比较当前 rank 的 PAR，超过 `imbalance_threshold` 后生成全局专家重排候选。
 * `num_runtime_experts < 0` 时只调整每张卡前面的 resident 热专家，后面的 cold experts 始终固定。
 * `num_runtime_experts >= 0` 时对全部 NPU slots 做全局负载均衡。
+* 同一周期先收集所有目标层的负载 delta，按 expert 数分组后合并执行 collective；各层只生成候选计划，不立即通信。
+* `BalanceCoordinator` 按预测 PAR 收益对候选层排序，并应用 `rebalance_max_layers` 和 `rebalance_min_improvement` 预算。
+* 选中层的 HCCL P2P 操作由 `ExpertUpdator.transfer_many()` 合并为一次 batch，完成后只执行一次 barrier，再发布全部映射。
+
+### `BalanceCoordinator`
+
+`runtime/balance_coordinator.py` 是跨层 rebalance 预算控制器。
+
+职责：
+
+* 收集同一 rebalance 周期内各层的候选布局、当前/目标 PAR 和迁移 expert 数。
+* 丢弃收益小于 `rebalance_min_improvement` 的候选。
+* 按预测收益、目标 PAR、迁移数和 layer id 做确定性排序。
+* 每周期最多选择 `rebalance_max_layers` 层，确保所有 EP rank 得到一致选择结果。
 
 ### `Profiler`
 
@@ -235,6 +252,10 @@ Profiler 统计在设备侧累加，避免 forward 每步同步到 CPU；保存�
 * 为 `offload` 模式提供 hot-first、cold-fixed 的初始 expert map。
 * 为 `balance` 模式提供全局专家重分布或冗余专家加载策略，并保证目标分布的负载评估与运行期 rebalance 判断一致。
 * 只输出策略结果，不执行参数传输，不修改 Runtime 对象。
+* 带 cold buffer 时先把每张卡固定 cold experts 的负载作为不可迁移基线，再分配 resident experts。
+* resident experts 先使用容量约束的 LPT 放置；冗余场景为热点副本预留各 rank slot，并按副本数重新计算负载份额。
+* 动态调整采用两阶段规划：所有层先生成低成本 LPT/副本候选；`BalanceCoordinator` 选中有限层后，再从最高负载 rank 开始执行有界 pair-swap 局部搜索，按最大负载、负载差和方差的字典序目标继续优化。
+* 同时评估从当前布局开始的低迁移候选；均衡目标相同时优先保留更多原有 rank/slot。
 
 ## 6. 计算层职责
 
@@ -347,13 +368,14 @@ Offload 模式只更新 cold buffer 内容，不拆分冷热计算，不对 `top
 3. `create_weights` 根据 `num_runtime_experts` 创建 resident、cold buffer 或 redundant slots。
 4. 如果 `enable_history_mapping = True`，初始化阶段读取历史负载并由 `Policy` 生成初始 expert map 和 `log2phy`。
 5. Forward 阶段按 `load_collect_interval` 将专家 token 统计写入 profiler。
-6. 按 `rebalance_interval` 读取 profiler delta，跨 EP rank 聚合当前窗口的全局 expert load。
-7. `LBVCAdaptor` 基于当前 slot 分布计算每个 rank 的负载，比较最高/最低负载比值。
-8. 如果窗口 token 数小于 `rebalance_min_step_tokens`，或最高/最低比值不超过 `imbalance_threshold`，本轮不调整。
-9. 超过阈值后，`Policy` 根据全局 expert load 计算新的全局 slot 分布。
-10. `LBVCAdaptor` 将目标 slot 分布对齐到当前物理 slot，生成 `ExpertUpdateTask`。
-11. `ExpertUpdator` 接收任务并通过 HCCL 完成迁入专家互传。
-12. `LBVCAdaptor` 在传输完成后发布新的 expert map、`log2phy` 和 profiler slot-to-global 映射。
+6. 按 `rebalance_interval` 读取所有目标层的 profiler delta，把多层 tensor 堆叠后跨 EP rank 合并聚合。
+7. `LBVCAdaptor` 基于当前完整 slot 分布计算每个 rank 的 PAR；存在 cold buffer 时先计入固定 cold experts 的负载。
+8. 如果窗口 token 数小于 `rebalance_min_step_tokens`，或 PAR 不超过 `imbalance_threshold`，该层不生成候选。
+9. 超过阈值后，`Policy` 在固定 cold 负载基线上快速计算 resident/redundant slots，形成第一阶段候选。
+10. `LBVCAdaptor` 将目标 slot 分布对齐到当前物理 slot，生成包含预测收益和迁移数的候选 `ExpertUpdateTask`。
+11. `BalanceCoordinator` 对所有层候选排序，按配置限制本周期实际替换层数；只对选中层执行 pair-swap 精调并重建迁移任务。
+12. `ExpertUpdator` 将选中层的 P2P 任务合并成一次 HCCL batch；传输完成后统一 barrier。
+13. `LBVCAdaptor` 原子发布选中层的新 expert map、`log2phy` 和 profiler slot-to-global 映射。
 
 Balance 模式不再局限于 pair 内对端专家副本，而是以全局负载为输入，直接调整 NPU 上由 `create_weights` 创建出的常驻专家参数和冗余专家参数，实现真正的全局负载均衡。
 

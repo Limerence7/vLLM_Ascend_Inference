@@ -19,6 +19,8 @@ class RuntimeConfig:
     rebalance_interval: int = 512
     policy_interval: int = 512
     imbalance_threshold: float = 1.5
+    rebalance_max_layers: int = 1
+    rebalance_min_improvement: float = 0.01
 
     num_buffers: int = 2
 
@@ -46,7 +48,12 @@ class RuntimeConfig:
         assert self.policy_interval > 0, (
             'policy_interval must be a positive integer.')
         assert self.imbalance_threshold >= 1.0, (
-            'imbalance_threshold must be a max/min ratio no smaller than 1.0.')
+            'imbalance_threshold must be a peak/average ratio no smaller '
+            'than 1.0.')
+        assert self.rebalance_max_layers >= 0, (
+            'rebalance_max_layers must be non-negative; 0 means unlimited.')
+        assert self.rebalance_min_improvement >= 0, (
+            'rebalance_min_improvement must be non-negative.')
         assert self.min_step_tokens >= 0, (
             'min_step_tokens must be a non-negative integer.')
         assert self.scheduler_policy in ("fifo", "throughput", "expert"), (

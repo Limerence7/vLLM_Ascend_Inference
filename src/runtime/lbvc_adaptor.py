@@ -3,11 +3,14 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from ..moeload.policy import ExpertPolicy
+from ..moeload.policy import (ExpertPolicy, peak_to_average,
+                              rank_loads_for_placement)
 from ..moeload.profiler import ExpertLoadProfiler
 from ..runtime_config import RuntimeConfig
 from .exo_executor import ExoExecutor
 from .exp_updator import ExpertUpdateTask, ExpertUpdator, HcclCopyTask
+from .balance_coordinator import (BalanceCoordinator,
+                                  LayerBalanceCandidate)
 
 
 @dataclass(frozen=True)
@@ -17,6 +20,15 @@ class BalanceUpdatePlan:
     expert_map: torch.Tensor
     log2phy: torch.Tensor | None
     task: ExpertUpdateTask
+
+
+@dataclass(frozen=True)
+class BalancePlanningContext:
+    counts: torch.Tensor
+    current_slots: list[list[int]]
+    fixed_slots: list[list[int]]
+    slots_per_rank: int
+    expert_ids: list[int] | None
 
 
 class LBVCAdaptor:
@@ -34,6 +46,11 @@ class LBVCAdaptor:
         self.policy = policy
         self.profiler = profiler
         self.exp_updator = ExpertUpdator()
+        self.coordinator = BalanceCoordinator(
+            max_layers=config.rebalance_max_layers,
+            min_improvement=config.rebalance_min_improvement,
+        )
+        self._pending_layer_loads: dict[int, tuple[object, torch.Tensor]] = {}
 
     def initial_expert_maps(
         self,
@@ -78,7 +95,7 @@ class LBVCAdaptor:
             group_list_type,
         )
         if step % int(self.config.rebalance_interval) == 0:
-            self._update_global_experts(layer)
+            self._queue_global_expert_update(layer)
 
     def record_slot_expert_tokens(
         self,
@@ -97,54 +114,216 @@ class LBVCAdaptor:
             slot_to_global,
         )
         if step % int(self.config.rebalance_interval) == 0:
-            self._update_global_experts(layer)
+            self._queue_global_expert_update(layer)
 
-    def _update_global_experts(self, layer) -> None:
-        counts = self._global_expert_counts(layer)
-        if counts is None:
-            return
+    def _queue_global_expert_update(self, layer) -> None:
+        layer_id = int(layer.moe_instance_id)
+        counts = self.profiler.get_layer_delta_load(layer_id)
+        if counts.numel() >= int(layer.logical_num_experts):
+            self._pending_layer_loads[layer_id] = (
+                layer,
+                counts[:int(layer.logical_num_experts)],
+            )
+        if self._is_rebalance_cycle_boundary(layer):
+            self._plan_and_flush_updates()
 
-        current_slots, slots_per_rank, expert_ids = (
-            self._current_balance_scope(layer))
-        if not self._should_rebalance(current_slots, counts):
-            return
+    def _build_candidate(
+        self,
+        layer,
+        counts: torch.Tensor,
+        current_full_slots: list[list[int]],
+    ) -> LayerBalanceCandidate | None:
+        current_slots, fixed_slots, slots_per_rank, expert_ids = (
+            self._current_balance_scope(layer, current_full_slots))
+        current_rank_loads = rank_loads_for_placement(
+            current_slots, counts, fixed_slots)
+        if not self._should_rebalance(current_rank_loads):
+            return None
 
-        target_slots = self.policy.global_balance_slots(
+        placement = self.policy.global_balance_plan(
             counts=counts,
             num_experts=layer.logical_num_experts,
             ep_size=layer.ep_size,
             slots_per_rank=slots_per_rank,
             expert_ids=expert_ids,
+            fixed_slots_by_rank=fixed_slots,
+            current_slots=current_slots,
+            max_swap_passes=1,
         )
-        plan = self._build_update_plan(layer, current_slots, target_slots)
+        plan = self._build_update_plan(
+            layer, current_slots, placement.slots)
         if not plan.task.copies:
+            return None
+
+        return LayerBalanceCandidate(
+            layer=layer,
+            plan=plan,
+            current_score=peak_to_average(current_rank_loads),
+            target_score=placement.peak_to_average,
+            migrations=len(plan.task.copies),
+            context=BalancePlanningContext(
+                counts=counts,
+                current_slots=current_slots,
+                fixed_slots=fixed_slots,
+                slots_per_rank=slots_per_rank,
+                expert_ids=expert_ids,
+            ),
+        )
+
+    def _plan_and_flush_updates(self) -> None:
+        reduced = self._reduce_pending_layer_loads()
+        layouts = self._gather_layer_layouts(
+            [layer for layer, _ in reduced])
+        for layer, counts in reduced:
+            if int(counts.sum().item()) > 0:
+                self.coordinator.submit(
+                    self._build_candidate(
+                        layer,
+                        counts,
+                        layouts[int(layer.moe_instance_id)],
+                    ))
+        self._flush_updates()
+
+    def _reduce_pending_layer_loads(
+        self,
+    ) -> list[tuple[object, torch.Tensor]]:
+        pending = [
+            self._pending_layer_loads[layer_id]
+            for layer_id in sorted(self._pending_layer_loads)
+        ]
+        self._pending_layer_loads.clear()
+        if not pending:
+            return []
+
+        reduced: list[tuple[object, torch.Tensor]] = []
+        groups: dict[int, list[tuple[object, torch.Tensor]]] = {}
+        for layer, counts in pending:
+            groups.setdefault(int(counts.numel()), []).append(
+                (layer, counts))
+
+        for group in groups.values():
+            layers = [layer for layer, _ in group]
+            stacked = torch.stack([counts for _, counts in group])
+            if dist.is_available() and dist.is_initialized():
+                device = next(layers[0].parameters()).device
+                stacked = stacked.to(device=device, dtype=torch.long)
+                dist.all_reduce(
+                    stacked,
+                    group=layers[0].moe_config.ep_group.device_group,
+                )
+                stacked = stacked.cpu()
+            reduced.extend(zip(layers, stacked.unbind(0)))
+        return reduced
+
+    def _gather_layer_layouts(
+        self,
+        layers: list[object],
+    ) -> dict[int, list[list[int]]]:
+        if not layers:
+            return {}
+        local_layouts = {
+            int(layer.moe_instance_id): self.executor.layout(layer)[0]
+            for layer in layers
+        }
+        if not dist.is_available() or not dist.is_initialized():
+            return {
+                layer_id: [slots]
+                for layer_id, slots in local_layouts.items()
+            }
+
+        first_layer = layers[0]
+        group = getattr(first_layer.moe_config.ep_group, "cpu_group", None)
+        world_size = dist.get_world_size(group)
+        all_layouts = [None] * world_size
+        dist.all_gather_object(all_layouts, local_layouts, group=group)
+        return {
+            layer_id: [
+                list(rank_layouts[layer_id])
+                for rank_layouts in all_layouts
+            ]
+            for layer_id in local_layouts
+        }
+
+    def _flush_updates(self) -> None:
+        candidates = self.coordinator.drain()
+        if not candidates:
             return
 
-        self.exp_updator.transfer(layer, plan.task)
+        candidates = [
+            self._refine_candidate(candidate)
+            for candidate in candidates
+        ]
+        candidates = [
+            candidate for candidate in candidates
+            if candidate.migrations > 0
+            and candidate.improvement >= (
+                self.config.rebalance_min_improvement)
+        ]
+        if not candidates:
+            return
+
+        self.exp_updator.transfer_many([
+            (candidate.layer, candidate.plan.task)
+            for candidate in candidates
+        ])
         if dist.is_available() and dist.is_initialized():
-            dist.barrier(group=getattr(layer.moe_config.ep_group,
+            first_layer = candidates[0].layer
+            dist.barrier(group=getattr(first_layer.moe_config.ep_group,
                                        "cpu_group", None))
 
-        self.executor.update_layout(layer, plan.local_slots)
-        self._install_plan(layer, plan)
-        self.profiler.update_layer_map(layer, self.executor.layout(layer)[0])
+        for candidate in candidates:
+            layer = candidate.layer
+            plan = candidate.plan
+            self.executor.update_layout(layer, plan.local_slots)
+            self._install_plan(layer, plan)
+            self.profiler.update_layer_map(
+                layer, self.executor.layout(layer)[0])
+
+    def _refine_candidate(
+        self,
+        candidate: LayerBalanceCandidate,
+    ) -> LayerBalanceCandidate:
+        context = candidate.context
+        assert isinstance(context, BalancePlanningContext)
+        layer = candidate.layer
+        placement = self.policy.global_balance_plan(
+            counts=context.counts,
+            num_experts=layer.logical_num_experts,
+            ep_size=layer.ep_size,
+            slots_per_rank=context.slots_per_rank,
+            expert_ids=context.expert_ids,
+            fixed_slots_by_rank=context.fixed_slots,
+            current_slots=context.current_slots,
+        )
+        plan = self._build_update_plan(
+            layer, context.current_slots, placement.slots)
+        return LayerBalanceCandidate(
+            layer=layer,
+            plan=plan,
+            current_score=candidate.current_score,
+            target_score=placement.peak_to_average,
+            migrations=len(plan.task.copies),
+            context=context,
+        )
 
     def _current_balance_scope(
         self,
         layer,
-    ) -> tuple[list[list[int]], int, list[int] | None]:
-        local_slots, hot_count = self.executor.layout(layer)
-        current_slots = self._all_rank_slots(layer, local_slots)
+        current_slots: list[list[int]],
+    ) -> tuple[list[list[int]], list[list[int]], int, list[int] | None]:
+        _, hot_count = self.executor.layout(layer)
         if not self.config.uses_cold_buffer:
-            return current_slots, len(current_slots[0]), None
+            fixed_slots = [[] for _ in current_slots]
+            return current_slots, fixed_slots, len(current_slots[0]), None
 
         resident_slots = [slots[:hot_count] for slots in current_slots]
+        fixed_slots = [slots[hot_count:] for slots in current_slots]
         resident_experts = sorted({
             expert_id
             for rank_slots in resident_slots
             for expert_id in rank_slots
         })
-        return resident_slots, hot_count, resident_experts
+        return resident_slots, fixed_slots, hot_count, resident_experts
 
     def _build_update_plan(
         self,
@@ -181,19 +360,17 @@ class LBVCAdaptor:
 
     def _should_rebalance(
         self,
-        current_slots: list[list[int]],
-        counts: torch.Tensor,
+        rank_loads: torch.Tensor,
     ) -> bool:
-        rank_loads = self._rank_loads(current_slots, counts)
         if int(rank_loads.sum().item()) < int(
                 self.config.rebalance_min_step_tokens):
             return False
 
         max_load = float(rank_loads.max().item())
-        min_load = float(rank_loads.min().item())
-        if max_load <= 0:
+        mean_load = float(rank_loads.mean().item())
+        if max_load <= 0 or mean_load <= 0:
             return False
-        ratio = float("inf") if min_load <= 0 else max_load / min_load
+        ratio = max_load / mean_load
         return ratio > float(self.config.imbalance_threshold)
 
     @staticmethod
@@ -201,19 +378,12 @@ class LBVCAdaptor:
         slots_by_rank: list[list[int]],
         counts: torch.Tensor,
     ) -> torch.Tensor:
-        load = counts.detach().cpu().to(torch.float32)
-        replicas: dict[int, int] = {}
-        for rank_slots in slots_by_rank:
-            for expert_id in rank_slots:
-                replicas[int(expert_id)] = replicas.get(int(expert_id), 0) + 1
+        return rank_loads_for_placement(slots_by_rank, counts)
 
-        rank_loads = torch.zeros(len(slots_by_rank), dtype=torch.float32)
-        for rank, rank_slots in enumerate(slots_by_rank):
-            for expert_id in rank_slots:
-                expert_id = int(expert_id)
-                if 0 <= expert_id < load.numel():
-                    rank_loads[rank] += load[expert_id] / replicas[expert_id]
-        return rank_loads
+    def _is_rebalance_cycle_boundary(self, layer) -> bool:
+        registered_layers = sorted(self.executor.layers)
+        return bool(registered_layers) and int(
+            layer.moe_instance_id) == registered_layers[-1]
 
     def _make_update_task(
         self,
@@ -272,36 +442,6 @@ class LBVCAdaptor:
             expert_id if expert_id is not None else next(incoming)
             for expert_id in aligned
         ]
-
-    @staticmethod
-    def _all_rank_slots(layer, local_slots: list[int]) -> list[list[int]]:
-        if not dist.is_available() or not dist.is_initialized():
-            return [list(local_slots)]
-
-        group = getattr(layer.moe_config.ep_group, "cpu_group", None)
-        world_size = (
-            dist.get_world_size(group)
-            if group is not None else int(layer.ep_size))
-        all_slots = [None] * world_size
-        dist.all_gather_object(all_slots, list(local_slots), group=group)
-        return [list(rank_slots) for rank_slots in all_slots]
-
-    def _global_expert_counts(self, layer) -> torch.Tensor | None:
-        counts = self.profiler.get_layer_delta_load(layer.moe_instance_id)
-        if counts.numel() < layer.logical_num_experts:
-            return None
-
-        counts = counts[:int(layer.logical_num_experts)]
-        if int(counts.sum().item()) <= 0:
-            return None
-        if not dist.is_available() or not dist.is_initialized():
-            return counts
-
-        device = next(layer.parameters()).device
-        device_counts = counts.to(device=device, dtype=torch.long)
-        dist.all_reduce(device_counts,
-                        group=layer.moe_config.ep_group.device_group)
-        return device_counts.cpu()
 
     @staticmethod
     def _native_slot(layer, global_expert_id: int) -> int:
