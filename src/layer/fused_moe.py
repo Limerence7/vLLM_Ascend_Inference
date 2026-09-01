@@ -1,4 +1,3 @@
-import os.path
 from typing import Callable
 
 import torch
@@ -10,24 +9,25 @@ from vllm.distributed import (get_dp_group, get_ep_group, get_pcp_group,
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig, FusedMoEParallelConfig, RoutingMethodType)
+    FusedMoEConfig, FusedMoEParallelConfig, RoutingMethodType,
+    get_routing_method_type)
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE, determine_expert_map, get_compressed_expert_map,
     maybe_roundup_hidden_size)
+from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
-from vllm_ascend.eplb.utils import moe_load_async_stream
-from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
+from vllm_ascend.eplb.core.eplb_utils import (generate_log2phy_map,
+                                              init_eplb_config)
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
-from vllm_ascend.ops.fused_moe.prepare_finalize import QuantType
-from vllm_ascend.quantization.w4a8_dynamic import \
+from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.quantization.methods.w4a8 import \
     AscendW4A8DynamicFusedMoEMethod
-from vllm_ascend.quantization.w8a8_dynamic import \
+from vllm_ascend.quantization.methods.w8a8_dynamic import \
     AscendW8A8DynamicFusedMoEMethod
-from vllm_ascend.utils import npu_stream_switch
 
 from ..runtime_config import get_runtime_config
 from ..runtime.runtime_core import RuntimeCore
@@ -130,6 +130,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
             tp_size_=tp_size_,
             pcp_size_=pcp_size_,
             dp_size_=dp_size_,
+            sp_size_=self.sp_size,
             vllm_parallel_config=vllm_config.parallel_config,
         )
 
@@ -149,11 +150,14 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.num_fused_shared_experts = 0
 
         hidden_size = maybe_roundup_hidden_size(
-            hidden_size,
-            moe_in_dtype,
-            quant_config,
-            self.moe_parallel_config,
+            hidden_size=hidden_size,
+            act_dtype=moe_in_dtype,
+            moe_parallel_config=self.moe_parallel_config,
             is_lora_enabled=vllm_config.lora_config is not None,
+            model_type=(vllm_config.model_config.hf_config.model_type
+                        if vllm_config.model_config is not None else None),
+            is_mxfp4_quant=(quant_config is not None
+                            and quant_config.is_mxfp4_quant(prefix, self)),
         )
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -177,39 +181,39 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.routed_scaling_factor = routed_scaling_factor
         self.e_score_correction_bias = e_score_correction_bias
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.activation = activation
+        self.activation = MoEActivation.from_str(activation)
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError(
                 "Only softmax scoring function is supported for non-grouped topk."
             )
-        if routing_method_type is not None:
-            self.routing_method_type = routing_method_type
-        elif scoring_func == "sigmoid":
-            self.routing_method_type = (
-                RoutingMethodType.DeepSeekV3 if self.use_grouped_topk else
-                RoutingMethodType.Llama4
-                if self.top_k == 1 else RoutingMethodType.TopK)
-        elif scoring_func == "softmax":
-            self.routing_method_type = (
-                RoutingMethodType.Renormalize if not self.renormalize else
-                RoutingMethodType.RenormalizeNaive)
-        else:
-            self.routing_method_type = RoutingMethodType.TopK
+        self.routing_method_type = (
+            RoutingMethodType(routing_method_type)
+            if routing_method_type is not None else get_routing_method_type(
+                scoring_func=scoring_func,
+                top_k=top_k,
+                renormalize=renormalize,
+                num_expert_group=num_expert_group,
+                has_e_score_bias=e_score_correction_bias is not None,
+            ))
 
         self.moe_config = FusedMoEConfig(
             num_experts=num_experts + num_redundant_experts,
             experts_per_token=top_k,
             hidden_dim=hidden_size,
+            intermediate_size_per_partition=self.intermediate_size_per_partition,
             num_local_experts=0,
+            num_logical_experts=num_experts,
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=moe_in_dtype,
+            activation=self.activation,
+            device=vllm_config.device_config.device,
+            routing_method=self.routing_method_type,
+            moe_backend=vllm_config.kernel_config.moe_backend,
             max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,
         )
-        self.moe_config_use_flashinfer_cutlass_kernels = (
-            self.moe_config.use_flashinfer_cutlass_kernels)
         self.quant_config = quant_config
         self.batched_hidden_states = None
         self.batched_router_logits = None
@@ -277,19 +281,25 @@ class RuntimeAscendFusedMoE(FusedMoE):
         self.moe_config.dp_group = get_dp_group()
         self.moe_config.ep_group = get_ep_group()
         self.moe_config.mc2_group = get_mc2_group()
+        method = getattr(self.quant_method, "quant_method", self.quant_method)
+        self.moe_config.supports_eplb = bool(
+            getattr(method, "supports_eplb", False))
 
     def _init_ascend_runtime_options(self, ascend_config,
                                      num_experts: int) -> None:
+        eplb_config = ascend_config.eplb_config
         self.dynamic_eplb = (
-            ascend_config.dynamic_eplb
-            or ascend_config.expert_map_record_path)
+            eplb_config.dynamic_eplb
+            or eplb_config.expert_map_record_path)
         if self.runtime_core.config.runtime_mode == "balance":
             self.dynamic_eplb = False
             if self.uses_w8a8:
                 self.quant_method.disable_native_dynamic_eplb()
 
-        self.expert_map_path = ascend_config.expert_map_path
-        self.global_redundant_expert_num = ascend_config.init_redundancy_expert
+        self.expert_map_path = eplb_config.expert_map_path
+        self.global_redundant_expert_num = (
+            eplb_config.num_redundant_experts
+            if eplb_config.dynamic_eplb else 0)
         self.global_num_experts = num_experts + self.global_redundant_expert_num
         if (self.runtime_core.config.runtime_mode == "balance"
                 and self.runtime_core.should_manage_layer(self)):
@@ -339,30 +349,20 @@ class RuntimeAscendFusedMoE(FusedMoE):
         return slot_to_global
 
     def _init_native_eplb_map(self, num_experts: int) -> bool:
-        if not (self.expert_map_path
-                and os.path.exists(self.expert_map_path)
-                and os.access(self.expert_map_path, os.R_OK)):
+        eplb_config = get_ascend_config().eplb_config
+        if not (eplb_config.dynamic_eplb or self.expert_map_path):
             return False
 
-        self.expert_load_balancer = ExpertLoadBalancer(
-            self.expert_map_path, num_experts)
-        self.expert_load_balancer.check_expert_map_tensor()
-        self.global_redundant_expert_num = (
-            self.expert_load_balancer.get_global_redundant_expert_num())
-        self.global_num_experts = num_experts + self.global_redundant_expert_num
-        try:
-            self.local_num_experts, self._expert_map = (
-                self.expert_load_balancer.get_rank_placement_map(
-                    self.moe_instance_id, self.ep_rank))
-            self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
-                self.moe_instance_id, self.ep_rank).npu()
-            return True
-        except Exception as e:
-            logger.warning(
-                f"Init expert map of mtp/eagle when using sample.{e}")
-            self.log2phy = _default_log2phy_map(
-                self.global_num_experts, self.ep_size, self.ep_rank).npu()
+        (_, expert_map, log2phy, redundant_count) = init_eplb_config(
+            eplb_config, self.moe_instance_id, self.moe_config)
+        self.global_redundant_expert_num = redundant_count
+        self.global_num_experts = num_experts + redundant_count
+        if expert_map is None:
             return False
+        self._expert_map = expert_map
+        self.local_num_experts = int((expert_map >= 0).sum().item())
+        self.log2phy = log2phy
+        return log2phy is not None
 
     def _apply_runtime_expert_layout(
             self, initial_slots: list[int]
@@ -467,18 +467,12 @@ class RuntimeAscendFusedMoE(FusedMoE):
 
     def _record_moe_load(self, group_list_type: int,
                          expert_tokens: torch.Tensor) -> None:
-        moe_load_stream = moe_load_async_stream()
-        current_stream = torch.npu.current_stream()
-
-        moe_load_stream.wait_stream(current_stream)
-        with npu_stream_switch(moe_load_stream):
-            if group_list_type != 1:
-                expert_tokens = torch.cat([
-                    expert_tokens[:1],
-                    expert_tokens[1:] - expert_tokens[:-1],
-                ])
-            self.moe_load += expert_tokens
-        current_stream.wait_stream(moe_load_stream)
+        if group_list_type != 1:
+            expert_tokens = torch.cat([
+                expert_tokens[:1],
+                expert_tokens[1:] - expert_tokens[:-1],
+            ])
+        self.moe_load += expert_tokens
 
     def maybe_all_reduce_tensor_model_parallel(
             self, final_hidden_states: torch.Tensor):
@@ -514,18 +508,20 @@ class RuntimeAscendFusedMoE(FusedMoE):
         enable_force_load_balance = forward_context.in_profile_run
         moe_comm_method = forward_context.moe_comm_method
 
-        hidden_states, router_logits, mc2_mask, context_metadata = (
-            moe_comm_method.prepare(
+        prepare_output = moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
-            replace_allreduce=forward_context.sp_enabled,
+            # ``sp_enabled`` is only attached by vLLM when sequence
+            # parallelism is active.  Profile/eager contexts in newer vLLM
+            # releases omit it, which is equivalent to SP being disabled.
+            replace_allreduce=getattr(forward_context, "sp_enabled", False),
             enable_shared_expert_dp=self.enable_shared_expert_dp,
-            quant_type=self.quant_type))
-
-        if isinstance(hidden_states, tuple):
-            hidden_states, pertoken_scale = hidden_states
-        else:
-            pertoken_scale = None
+            quant_type=self.quant_type)
+        hidden_states = prepare_output.hidden_states
+        router_logits = prepare_output.router_logits
+        mc2_mask = prepare_output.mc2_mask
+        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
+        pertoken_scale = prepare_output.pertoken_scale
 
         final_hidden_states = self.quant_method.apply(
             layer=self,
@@ -542,7 +538,7 @@ class RuntimeAscendFusedMoE(FusedMoE):
             custom_routing_function=self.custom_routing_function,
             scoring_func=self.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
+            activation=self.activation.value,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             quantized_x_for_share=None,
             dynamic_scale_for_share=None,
@@ -562,6 +558,43 @@ class RuntimeAscendFusedMoE(FusedMoE):
         final_hidden_states = forward_context.moe_comm_method.finalize(
             hidden_states=final_hidden_states,
             reduce_results=self.reduce_results,
-            context_metadata=context_metadata)
+            padded_hidden_states_shape=padded_hidden_states_shape)
 
         return final_hidden_states
+
+    def forward_native(self, hidden_states: torch.Tensor,
+                       router_logits: torch.Tensor):
+        return self.forward_impl(hidden_states, router_logits)
+
+    def forward_oot(self, hidden_states: torch.Tensor,
+                    router_logits: torch.Tensor):
+        return self.forward_impl(hidden_states, router_logits)
+
+
+class RuntimeAscendSharedFusedMoE(SharedFusedMoE,
+                                  RuntimeAscendFusedMoE):
+    """vLLM 0.18 shared-expert wrapper around the Runtime routed experts.
+
+    Shared experts remain on the native model path.  The Runtime only owns
+    the routed experts, so the non-overlapped ``SharedFusedMoE`` path is used
+    to preserve vLLM's ``(shared_out, routed_out)`` contract.
+    """
+
+    def __init__(self,
+                 shared_experts: torch.nn.Module | None,
+                 gate: torch.nn.Module | None = None,
+                 use_overlapped: bool = True,
+                 routed_input_transform: torch.nn.Module | None = None,
+                 **kwargs):
+        RuntimeAscendFusedMoE.__init__(self, **kwargs)
+        self._shared_experts = shared_experts
+        self._gate = gate
+        self._routed_input_transform = routed_input_transform
+
+        # Runtime's communication path currently computes routed experts
+        # only.  Let SharedFusedMoE calculate the shared branch separately.
+        self.use_overlapped = False
+
+    @property
+    def gate(self) -> torch.nn.Module | None:
+        return self._gate

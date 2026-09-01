@@ -31,7 +31,12 @@ Runtime 面向三类互斥运行模式：
 vLLM_Ascend_Inference/
 ├── src/
 │   ├── __init__.py
-│   ├── model.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── common.py
+│   │   ├── qwen3_moe.py
+│   │   ├── mixtral.py
+│   │   └── qwen3_5.py
 │   ├── runtime_config.py
 │   ├── utils.py
 │   ├── scheduler/
@@ -73,7 +78,7 @@ vLLM_Ascend_Inference/
 目录职责：
 
 * `src/__init__.py`：插件注册入口，接收 Runtime 配置并注册自定义 Qwen3 MoE 模型。
-* `src/model.py`：模型接管入口，按配置选择需要替换的 MoE 层；`profile` 模式下保持原生专家计算路径并接入 profiler。
+* `src/models/`：模型接管入口。`common.py` 提供 vLLM 0.18 通用的层选择、Runtime 配置和动态 MoE 工厂；`qwen3_moe.py`、`mixtral.py`、`qwen3_5.py` 隔离各模型的 MoE 注入点。模型通过字符串延迟注册，避免插件加载阶段提前初始化设备相关模块。
 * `src/runtime_config.py`：统一配置定义和校验，覆盖模式选择、接管层、CPU memory、profiler、policy 和 `num_runtime_experts` 参数。
 * `src/scheduler/`：vLLM V1 请求调度子系统；`core.py` 集中实现自动参数推导、请求级 MoE 激活画像和 prefill/decode 策略，`patch.py` 负责接入 V1 Scheduler，`__init__.py` 提供公开接口。
 * `src/layer/fused_moe.py`：Runtime FusedMoE 层入口，负责专家 slot 创建、权重拦截、forward 接管和 profiler 写入。
@@ -89,7 +94,7 @@ vLLM_Ascend_Inference/
 
 1. vLLM 加载插件，`src/__init__.py` 解析外部参数并生成全局 `RuntimeConfig`。
 2. 插件注册自定义 Qwen3 MoE 模型。
-3. `src/model.py` 根据模型层数、专家数、EP/TP 并行信息和 rank 信息规范化配置。
+3. `src/models/` 中对应的模型适配器根据模型层数、专家数、EP 并行信息和 rank 信息规范化配置。
 4. 如果 `runtime_mode = profile`，目标层保持原生专家计算路径，但接入 profiler 记录专家负载。
 5. 如果 `runtime_mode = offload` 或 `runtime_mode = balance`，根据 `runtime_layer_ids` 或 `interval` 计算 Runtime 接管层。
 6. 目标 MoE 层替换为 `RuntimeAscendFusedMoE`，其他层继续使用原生 vLLM-Ascend 实现。

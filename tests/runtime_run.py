@@ -1,69 +1,81 @@
-import src
 import json
+import os
 import random
 from pathlib import Path
+
+# Ascend workers must not inherit PyTorch's initialized OpenMP state via fork.
+# Keep explicit caller choices intact while making this script safe by default.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+import src
 
 from src.runtime_config import RuntimeConfig
 from vllm import LLM, SamplingParams
 
+TEST_CONFIG_LIST = {
+    "Qwen3-30B-A3B": {
+        "model_path": "/workspace/models/Qwen3-30B-A3B",
+        "batch_size": 1024,
+        "max_length": 2048,
+        "max_new_tokens": 128,
+        "world_size": 4,
+        "utilization": 0.85,
+    },
+    "Qwen3-235B-A22B": {
+        "model_path": "/workspace/models/Qwen3-235B-A22B",
+        "batch_size": 512,
+        "max_length": 1024,
+        "max_new_tokens": 512,
+        "world_size": 8,
+        "utilization": 0.98,
+    },
+    "Qwen3-235B-A22B-W8A8": {
+        "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
+        "batch_size": 512,
+        "max_length": 1024,
+        "max_new_tokens": 128,
+        "world_size": 4,
+        "utilization": 0.98,
+    },
+    "Qwen3.5-35B-A3B": {
+        "model_path": "/workspace/models/Qwen3.5-35B-A3B",
+        "batch_size": 1024,
+        "max_length": 4096,
+        "max_new_tokens": 128,
+        "world_size": 4,
+        "utilization": 0.85,
+    },
+    "Mixtral-8x7B": {
+        "model_path": "/workspace/models/Mixtral-8x7B-Instruct-v0.1",
+        "batch_size": 1024,
+        "max_length": 4096,
+        "max_new_tokens": 128,
+        "world_size": 4,
+        "utilization": 0.95,
+    },
+}
 
+MODEL_NAME = "Qwen3-30B-A3B"
+TEST_CONFIG = TEST_CONFIG_LIST[MODEL_NAME]
 LOAD_HISTORY_PATH = (
     Path(__file__).resolve().parents[1]
     / "load_records"
-    / "only_run_load_history"
+    / f"{MODEL_NAME}_load_history"
 )
-TEST_CONFIG = {
-    "model_path": "/workspace/models/Qwen3-30B-A3B",
-    "batch_size": 1024,
-    "max_length": 2048,
-    "max_new_tokens": 128,
-    "world_size": 4,
-    "utilization": 0.85,
-}
-
-# LOAD_HISTORY_PATH = (
-#     Path(__file__).resolve().parents[1]
-#     / "load_records"
-#     / "only_run_235b_w8a8"
-# )
-# TEST_CONFIG = {
-#     "model_path": "/workspace/models/Qwen3-235B-A22B-W8A8",
-#     "batch_size": 512,
-#     "max_length": 1024,
-#     "max_new_tokens": 512,
-#     "world_size": 4,
-#     "utilization": 0.98,
-# }
-
-# LOAD_HISTORY_PATH = (
-#     Path(__file__).resolve().parents[1]
-#     / "load_records"
-#     / "only_run_235b"
-# )
-# TEST_CONFIG = {
-#     "model_path": "/workspace/models/Qwen3-235B-A22B",
-#     "batch_size": 512,
-#     "max_length": 1024,
-#     "max_new_tokens": 32,
-#     "world_size": 8,
-#     "utilization": 0.98,
-# }
 
 RUNTIME_CONFIG = RuntimeConfig(
     runtime_mode="balance",
-    interval=4,
+    interval=1,
     num_buffers=2,
     num_runtime_experts=0,
     cpu_pin_memory=True,
-    runtime_layer_ids=[],
+    runtime_layer_ids=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
     # load_history_path=str(LOAD_HISTORY_PATH),
     load_history_path=None,
     enable_load_collection=True,
-    enable_scheduler=False,
+    enable_scheduler=True,
+    scheduler_policy='auto',
     enable_history_mapping=False,
-    scheduler_policy="expert",
-    scheduler_reorder_window=64,
-    rebalance_min_step_tokens=16384,
 )
 
 def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):
@@ -143,6 +155,9 @@ def save_load_history(llm: LLM) -> None:
 def shutdown_llm(llm: LLM) -> None:
     llm.llm_engine.engine_core.shutdown()
 
+
+# 730.06x 1048.25 toks/s
+# 730.06x 1075.32 toks/s
 
 if __name__ == "__main__":
     src.register_plugin(RUNTIME_CONFIG)

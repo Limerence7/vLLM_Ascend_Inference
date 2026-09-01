@@ -1,6 +1,6 @@
 from vllm import ModelRegistry
 
-from .model import RuntimeQwen3MoeForCausalLM
+from .models import RUNTIME_MODELS
 from .runtime_config import RuntimeConfig, set_runtime_config
 
 
@@ -12,6 +12,6 @@ def register_plugin(config: RuntimeConfig | None = None):
         print("Applying request scheduler patch...")
 
         apply_scheduler_patch(runtime_config)
-    ModelRegistry.register_model("Qwen3MoeForCausalLM",
-                                 RuntimeQwen3MoeForCausalLM)
-    return RuntimeQwen3MoeForCausalLM
+    for architecture, model_cls in RUNTIME_MODELS.items():
+        ModelRegistry.register_model(architecture, model_cls)
+    return RUNTIME_MODELS["Qwen3MoeForCausalLM"]

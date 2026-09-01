@@ -33,8 +33,16 @@ Inference_Config = {
         "world_size": 4,
         "utilization": 0.98,
     },
+    "Qwen3.5-35B-A3B": {
+        "model_path": "/workspace/models/Qwen3.5-35B-A3B",
+        "batch_size": 1024,
+        "max_length": 2048,
+        "max_new_tokens": 128,
+        "world_size": 4,
+        "utilization": 0.85,
+    },
 }
-
+# Qwen3-30B-A3B
 current_config = Inference_Config["Qwen3-30B-A3B"]
 
 def load_contents_from_jsonl(jsonl_path, tokenizer, batch_size, max_length):

@@ -82,7 +82,9 @@ def _prepare_inputs(self, scheduler_output, *args, **kwargs):
     prepared = _ORIGINAL_PREPARE_INPUTS(
         self, scheduler_output, *args, **kwargs)
     discard_worker_activation_requests(scheduler_output.finished_req_ids)
-    token_counts = prepared[2]
+    # vLLM-Ascend 0.18 returns total_num_scheduled_tokens at index 2;
+    # per-request counts are the second _prepare_inputs argument.
+    token_counts = args[0] if args else kwargs["num_scheduled_tokens"]
     begin_worker_activation_batch(self.input_batch.req_ids, token_counts)
     return prepared
 

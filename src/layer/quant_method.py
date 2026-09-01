@@ -9,8 +9,10 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
-from vllm_ascend.quantization.quant_config import AscendFusedMoEMethod
-from vllm_ascend.quantization.w8a8_dynamic import \
+from vllm_ascend.ops.fused_moe.moe_runtime_args import (
+    build_fused_experts_input, build_token_dispatch_input)
+from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
+from vllm_ascend.quantization.methods.w8a8_dynamic import \
     AscendW8A8DynamicFusedMoEMethod, scale_from_float_to_int64
 from vllm_ascend.utils import (AscendDeviceType, get_ascend_device_type,
                                maybe_trans_nz)
@@ -56,6 +58,40 @@ class RuntimeFusedMoEMethod:
     @staticmethod
     def _unwrap_result(result):
         return result[0] if isinstance(result, tuple) else result
+
+    @staticmethod
+    def _normalize_fused_result(result, dynamic_eplb: bool):
+        if not hasattr(result, "routed_out"):
+            return result
+        if dynamic_eplb:
+            return (result.routed_out, result.group_list_type,
+                    result.expert_tokens)
+        return result.routed_out
+
+    @staticmethod
+    def _build_fused_input(layer, hidden_states, topk_weights, topk_ids,
+                           w1, w2, expert_map, log2phy,
+                           global_redundant_expert_num, mc2_mask,
+                           apply_router_weight_on_input, dynamic_eplb,
+                           pertoken_scale, w1_scale=None, w2_scale=None):
+        return build_fused_experts_input(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            w1=w1,
+            w2=w2,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            quant_type=layer.quant_type,
+            dynamic_eplb=dynamic_eplb,
+            expert_map=expert_map,
+            global_redundant_expert_num=global_redundant_expert_num,
+            mc2_mask=mc2_mask,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            log2phy=log2phy,
+            pertoken_scale=pertoken_scale,
+            activation=layer.activation.value,
+        )
 
     def _wait_and_prefetch_next(self, layer, cold_experts) -> None:
         cold_experts.wait()
@@ -223,6 +259,7 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
             with dispatch_with_local_experts(moe_comm_method,
                                              experts.num_experts):
                 return self._runtime_fused_experts(
+                    layer=layer,
                     moe_comm_method=moe_comm_method,
                     hidden_states=hidden_states,
                     topk_weights=topk_weights,
@@ -240,30 +277,25 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
                     global_redundant_expert_num=global_redundant_expert_num)
 
         local_num_experts = experts.w13_weight.shape[0]
-        eplb_kwargs = {}
-        if log2phy is not None:
-            eplb_kwargs = {
-                "log2phy": log2phy,
-                "global_redundant_expert_num": global_redundant_expert_num,
-            }
         with dispatch_with_local_experts(moe_comm_method, local_num_experts):
-            return moe_comm_method.fused_experts(
-                hidden_states=hidden_states,
+            fused_input = self._build_fused_input(
+                layer, hidden_states, topk_weights, topk_ids,
                 w1=experts.w13_weight,
                 w2=experts.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                global_num_experts=global_num_experts,
                 expert_map=expert_map,
-                shared_experts=shared_experts,
+                log2phy=log2phy,
+                global_redundant_expert_num=global_redundant_expert_num,
+                mc2_mask=mc2_mask,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 dynamic_eplb=dynamic_eplb,
-                mc2_mask=mc2_mask,
-                pertoken_scale=pertoken_scale,
-                **eplb_kwargs)
+                pertoken_scale=pertoken_scale)
+            result = moe_comm_method.fused_experts(
+                fused_experts_input=fused_input)
+            return self._normalize_fused_result(result, dynamic_eplb)
 
     @staticmethod
     def _runtime_fused_experts(
+            layer,
             moe_comm_method,
             hidden_states: torch.Tensor,
             topk_weights: torch.Tensor,
@@ -279,36 +311,32 @@ class RuntimeUnquantizedFusedMoEMethod(RuntimeFusedMoEMethod,
             pertoken_scale: torch.Tensor | None,
             log2phy: torch.Tensor | None = None,
             global_redundant_expert_num: int = 0):
-        results = moe_comm_method.token_dispatcher.token_dispatch(
-            hidden_states=hidden_states,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            expert_map=expert_map,
-            log2phy=log2phy,
+        fused_input = RuntimeFusedMoEMethod._build_fused_input(
+            layer=layer, hidden_states=hidden_states,
+            topk_weights=topk_weights, topk_ids=topk_ids, w1=w1, w2=w2,
+            expert_map=expert_map, log2phy=log2phy,
             global_redundant_expert_num=global_redundant_expert_num,
-            shared_experts=shared_experts,
-            quantized_x_for_share=None,
-            dynamic_scale_for_share=None,
             mc2_mask=mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            with_quant=False,
-            dynamic_eplb=dynamic_eplb,
-            pertoken_scale=pertoken_scale)
+            dynamic_eplb=dynamic_eplb, pertoken_scale=pertoken_scale)
+        results = moe_comm_method.token_dispatcher.token_dispatch(
+            token_dispatch_input=build_token_dispatch_input(
+                fused_experts_input=fused_input))
 
-        expert_tokens = results["group_list"]
-        group_list_type = results["group_list_type"]
+        expert_tokens = results.group_list
+        group_list_type = results.group_list_type
         mlp_output = runtime_unified_apply_mlp(
-            hidden_states=results["hidden_states"],
+            hidden_states=results.hidden_states,
             w1=w1,
             w2=w2,
             group_list=expert_tokens,
             group_list_type=group_list_type,
-            topk_scales=results.get("topk_scales"),
+            topk_scales=results.topk_scales,
             with_quant=False,
             dynamic_eplb=dynamic_eplb)
         final_hidden_states = moe_comm_method.token_dispatcher.token_combine(
             hidden_states=mlp_output,
-            context_metadata=results.get("context_metadata"))
+            combine_metadata=results.combine_metadata)
         if dynamic_eplb:
             return final_hidden_states, group_list_type, expert_tokens
         return final_hidden_states
@@ -379,15 +407,10 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
         w2_scale = self._scale_arg(experts, w2_scale_list_name,
                                    w2_scale_name, fused_mc2)
         local_num_experts = int(w1[0].shape[0]) if fused_mc2 else len(w1)
-        eplb_kwargs = {}
-        if log2phy is not None:
-            eplb_kwargs = {
-                "log2phy": log2phy,
-                "global_redundant_expert_num": global_redundant_expert_num,
-            }
         if combined_experts:
             with dispatch_with_local_experts(moe_comm_method, local_num_experts):
                 return self._runtime_fused_experts(
+                    layer=layer,
                     moe_comm_method=moe_comm_method,
                     hidden_states=hidden_states,
                     topk_weights=topk_weights,
@@ -403,27 +426,29 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
                     dynamic_eplb=dynamic_eplb,
                     mc2_mask=mc2_mask,
                     pertoken_scale=pertoken_scale,
-                    **eplb_kwargs)
+                    log2phy=log2phy,
+                    global_redundant_expert_num=global_redundant_expert_num)
         with dispatch_with_local_experts(moe_comm_method, local_num_experts):
-            return moe_comm_method.fused_experts(
-                hidden_states=hidden_states,
-                pertoken_scale=pertoken_scale,
+            fused_input = self._build_fused_input(
+                layer, hidden_states, topk_weights, topk_ids,
                 w1=w1,
                 w1_scale=w1_scale,
                 w2=w2,
                 w2_scale=w2_scale,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                global_num_experts=global_num_experts,
-                use_int8_w8a8=True,
                 expert_map=expert_map,
-                shared_experts=shared_experts,
-                dynamic_eplb=dynamic_eplb,
+                log2phy=log2phy,
+                global_redundant_expert_num=global_redundant_expert_num,
                 mc2_mask=mc2_mask,
-                **eplb_kwargs)
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                dynamic_eplb=dynamic_eplb,
+                pertoken_scale=pertoken_scale)
+            result = moe_comm_method.fused_experts(
+                fused_experts_input=fused_input)
+            return self._normalize_fused_result(result, dynamic_eplb)
 
     @staticmethod
     def _runtime_fused_experts(
+            layer,
             moe_comm_method,
             hidden_states: torch.Tensor,
             topk_weights: torch.Tensor,
@@ -441,40 +466,37 @@ class RuntimeW8A8DynamicFusedMoEMethod(RuntimeFusedMoEMethod,
             pertoken_scale: torch.Tensor | None,
             log2phy: torch.Tensor | None = None,
             global_redundant_expert_num: int = 0):
-        results = moe_comm_method.token_dispatcher.token_dispatch(
-            hidden_states=hidden_states,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            expert_map=expert_map,
-            log2phy=log2phy,
+        fused_input = RuntimeFusedMoEMethod._build_fused_input(
+            layer=layer, hidden_states=hidden_states,
+            topk_weights=topk_weights, topk_ids=topk_ids,
+            w1=w1, w1_scale=w1_scale, w2=w2, w2_scale=w2_scale,
+            expert_map=expert_map, log2phy=log2phy,
             global_redundant_expert_num=global_redundant_expert_num,
-            shared_experts=shared_experts,
-            quantized_x_for_share=None,
-            dynamic_scale_for_share=None,
             mc2_mask=mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            with_quant=True,
-            dynamic_eplb=dynamic_eplb,
-            pertoken_scale=pertoken_scale)
+            dynamic_eplb=dynamic_eplb, pertoken_scale=pertoken_scale)
+        results = moe_comm_method.token_dispatcher.token_dispatch(
+            token_dispatch_input=build_token_dispatch_input(
+                fused_experts_input=fused_input))
 
-        expert_tokens = results["group_list"]
-        group_list_type = results["group_list_type"]
+        expert_tokens = results.group_list
+        group_list_type = results.group_list_type
         mlp_output = runtime_unified_apply_mlp(
-            hidden_states=results["hidden_states"],
+            hidden_states=results.hidden_states,
             w1=w1,
             w1_scale=w1_scale,
             w2=w2,
             w2_scale=w2_scale,
             group_list=expert_tokens,
-            dynamic_scale=results.get("dynamic_scale"),
+            dynamic_scale=results.dynamic_scale,
             group_list_type=group_list_type,
-            topk_scales=results.get("topk_scales"),
+            topk_scales=results.topk_scales,
             with_quant=True,
             fusion=True,
             dynamic_eplb=dynamic_eplb)
         final_hidden_states = moe_comm_method.token_dispatcher.token_combine(
             hidden_states=mlp_output,
-            context_metadata=results.get("context_metadata"))
+            combine_metadata=results.combine_metadata)
         if dynamic_eplb:
             return final_hidden_states, group_list_type, expert_tokens
         return final_hidden_states
